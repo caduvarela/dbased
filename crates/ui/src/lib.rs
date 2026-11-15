@@ -1,6 +1,6 @@
 //! The only crate allowed to use GPUI. Talks to the core exclusively via `dbased-commands`.
 
-use gpui::{AppContext, WindowOptions};
+use gpui::{AppContext, TitlebarOptions, WindowOptions};
 use gpui_component::Root;
 
 pub fn run() {
@@ -8,7 +8,14 @@ pub fn run() {
         gpui_component::init(app);
         app.spawn(async move |app| {
             let open_result = app.update(|app| {
-                app.open_window(WindowOptions::default(), |window, app| {
+                let options = WindowOptions {
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("DBased".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                app.open_window(options, |window, app| {
                     let view = app.new(|_| EmptyView);
                     app.new(|app| Root::new(view, window, app))
                 })
