@@ -8,7 +8,7 @@ Goal: the SQL client developers enjoy using every day. Fast, clean, predictable.
 1. `docs/PROJECT.md`: Constitution (Part A) and Architecture Decisions (Part B). Part B wins on technical specifics, Part A wins on philosophy.
 2. `HANDOFF.md`: current working state and the next concrete step.
 
-Durable decisions go in `docs/PROJECT.md`, never only in `HANDOFF.md`. Update `HANDOFF.md` at every milestone and before ending a session. It must never reach `main`.
+Durable decisions go in `docs/PROJECT.md`, never only in `HANDOFF.md`. Update `HANDOFF.md` at every milestone and before ending a session. It must never reach `master`.
 
 ## Language
 

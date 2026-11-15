@@ -1000,7 +1000,7 @@ Rules:
 
 `HANDOFF.md` is working state, not documentation.
 
-It never reaches the main branch.
+It never reaches the master branch.
 
 Delete it in the final squash, the one that prepares the branch for merge, and confirm that the pull request diff does not contain it.
 
