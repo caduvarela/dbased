@@ -71,6 +71,12 @@ reasoning kept, rather than deleted.
     detached windows are Later (0.4, 9.2). Layout persists as an opaque JSON
     file per workspace (5.2).
   - Gate passed for starting the real UI, with scheduled checks left (Part 10).
+- **2026-11 — Human testing on X11/MATE.** Sections marked
+  **(revised 2026-11, human test)**:
+  - Grid end-of-list check passed; Latin input, dead keys and paste work;
+    CJK and Wayland still pending (Part 10).
+  - The editor must take focus on open and tab activation (6.1); shortcut
+    tests go through the real keymap (7.1).
 
 ---
 
@@ -2020,7 +2026,7 @@ to loopback on an ephemeral port only.
 These sections are the GPUI-era replacements for the superseded Tauri-era UI
 decisions listed in 0.4. They live entirely in the `ui` crate.
 
-### 6.1 SQL editor *(revised 2026-11, spike)*
+### 6.1 SQL editor *(revised 2026-11, spike, human test)*
 
 **Decision.** Use gpui-component's native code editor (`EditorState` with
 `.language("sql")`) for the SQL editor; it is used as provided, not rebuilt.
@@ -2039,6 +2045,11 @@ upstream target (about 50K lines or 5 MB, to be tuned) open only after a
 warning that names the size. Editor memory is a **watch item, not a budget**,
 until it is known whether the growth is a one-time cost (highlighting, layout)
 or grows with edits; the latter would be a defect to fix upstream.
+
+*(Human test, 2026-11.)* Every editor shortcut needs keyboard focus, and the
+spike's shortcuts silently did nothing until it focused the editor. Rule: the
+editor takes focus when its tab is opened or activated, and a tab restores
+focus to its editor when the user returns to it.
 
 **Why.** Native, Tree-sitter highlighted, LSP-capable, GPU-rendered. Covers a SQL
 client's editing needs without a webview. Serves Performance and Simplicity.
@@ -2170,7 +2181,7 @@ containers must start (reusing one container per binary limits this). Keeping bo
 testcontainers and a development compose file means image versions live in two
 places; the single declaration in item 2 prevents drift.
 
-### 7.1 UI testing *(new 2026-11)*
+### 7.1 UI testing *(new 2026-11, revised 2026-11, human test)*
 
 **Decision.** The UI is tested automatically in layers, all in `crates/ui` (and
 `crates/app` where needed), none touching a real database (a fake command/event
@@ -2203,6 +2214,13 @@ channel stands in for the Core, 0.2):
    it with `xdotool` (X11) or `ydotool` (Wayland), capture with `import`, `grim`
    or a desktop-portal screenshot, compare loosely. Fragile and compositor
    dependent, so never required in CI.
+
+*(Human test, 2026-11.)* Shortcut and multi-cursor behavior is tested through
+the real keymap, not by calling actions directly: `dispatch_keystroke` in
+layer 2, XTEST events (as `xdotool` sends them, also under Xvfb) in layer 4.
+Gap: the editor has no public getter for the selection count or the list of
+selections, so such tests can only assert through text or a DBased-side
+wrapper until upstream exposes one (OPEN-6).
 
 Not adopted: Zed's own visual runner and `VisualTestAppContext` (macOS only), and
 the `gpui-mcp` bridge (needs a patched GPUI; revisit only if it supports the
@@ -2350,7 +2368,7 @@ loop is solid.
 
 ---
 
-## Part 10 — Week-One Spike *(new 2026-11, revised 2026-11, spike)*
+## Part 10 — Week-One Spike *(new 2026-11, revised 2026-11, spike, human test)*
 
 **Decision.** Before the real UI is built, a time-boxed spike validates the
 riskiest assumptions of the GPUI bet and of the new SQL handling. It is a gate:
@@ -2367,20 +2385,34 @@ Checks:
    RSS 109 to 138 MB over 5M rows (200-row windows, 4,800-row cache). Quiet
    machine: steady 16.7 ms frames (p95 ~16.8) at 2k-500k rows/s, fetch latency
    up to 50 ms; under CPU contention 33 ms. The grid costs 8-11 ms CPU per
-   frame, hence the budget rules in 6.3.
+   frame, hence the budget rules in 6.3. *Human check (2026-11, X11/MATE):*
+   scrolling to the end of the 5M rows with the mouse wheel and by dragging
+   the scrollbar was smooth to the last row with correct positions: pass.
 2. **Editor.** Open a 100,000-line SQL file; exercise highlighting, find,
    multi-cursor (Alt-click, add-cursor above/below, `add_selection`), soft wrap.
    **DONE (2026-11).** First render 165 ms (next frame 295 ms), insert at line
    50,000 7.7 ms avg (p95 8.3), jump to end 17 ms; RSS 127 MB after open,
    ~295-385 MB after edits (watch item, 6.1). Alt-click and `add_selection`
    (select-all-occurrences) work. Needs `tree-sitter-sql` and `gpui-base` (0.1).
+   *Human test (2026-11, X11/MATE):* editor shortcuts first failed because the
+   spike never focused the editor on open; reproduced under Xvfb with XTEST
+   key events and fixed, after which Ctrl+D (the spike's select-all) gave
+   5,000 selections (its cap), Shift+Alt+Down 2 cursors, and Ctrl+Alt+Down
+   (after adding that binding) 3 cursors after two presses. Rule: the editor
+   takes focus when opened and when its tab is activated (6.1). Alt-click
+   never reached the app because the window manager grabs Alt+click (9.4);
+   the spike's help text claiming Ctrl+Alt+Arrows on Linux was wrong.
 3. **Input quality.** IME composition with CJK input, dead keys, and clipboard
    behavior; behavior on Wayland and X11 for Linux, then macOS and Windows.
    **PARTIAL (2026-11).** No preedit/commit callbacks exist, so this is a
    manual checklist only (6.1). gpui picks Wayland if `WAYLAND_DISPLAY` is set,
-   else X11 if `DISPLAY` is set (`XDG_SESSION_TYPE` is ignored). Pending: the
-   checklist (CJK via fcitx5/ibus, dead keys, emoji, large multi-line paste,
-   undo/redo) run by a person on X11 and Wayland.
+   else X11 if `DISPLAY` is set (`XDG_SESSION_TYPE` is ignored). *Human test
+   (2026-11, X11/MATE):* Latin input including dead keys and accents, a large
+   multi-line paste, and basic editing and undo work. The emoji hotkeys
+   (Ctrl+. / Ctrl+;) opened nothing: no input method runs on that machine,
+   and gpui on X11 talks only XIM, so this is an environment limit, not an
+   app bug (6.1). Pending: CJK composition with a real input method (XIM on
+   X11), and the whole checklist on Wayland.
 4. **Startup.** Cold start to first interactive window. Budget: under 1 second.
    **DONE (2026-11, warm caches).** Median 136 ms (126-153, 10 runs) from
    process start to first rendered frame, release build, empty window.
@@ -2414,13 +2446,12 @@ Checks:
 
 **Gate status (2026-11).** Passed for starting the real UI: no finding
 triggers an escape hatch (0.1), and every remaining check can only be fixed
-inside `ui` (upstream fix or contained workaround). Still pending, scheduled
-rather than blocking: item 3's manual checklist (before the editor milestone
-closes); a person's visual check of grid smoothness and row positions near the
-end of 5M rows, with wheel and scrollbar drag (all runs used programmatic
-scroll); items 1-5 on Wayland; and the grid on a lower-end CPU/GPU and under
-GPU contention (before the first release). A failure there that cannot be
-fixed in `ui` reopens this gate.
+inside `ui` (upstream fix or contained workaround). The human checks of
+2026-11 (grid end-of-list, Latin input, editor shortcuts on X11) passed.
+Still pending, scheduled rather than blocking: CJK composition with a real
+input method (before the editor milestone closes); items 1-5 on Wayland; and
+the grid on a lower-end CPU/GPU and under GPU contention (before the first
+release). A failure there that cannot be fixed in `ui` reopens this gate.
 
 **Why.** The documentation is a plan; these are the points where the plan could
 be wrong in ways that are expensive to discover later. Serves Engineering
@@ -2489,8 +2520,8 @@ fallback paths (a wrapped or custom editor element) remain available.
 - Default keymap preset (9.4): recommendation DBeaver-like.
 - Documentation strategy is being defined separately and, once agreed, becomes
   its own standard (and likely a Constitution pillar).
-- Part 10 remaining checks (gate status there): item 3 manual IME checklist,
-  human visual check of the grid end-of-list, Wayland runs, lower-end hardware.
+- Part 10 remaining checks (gate status there): CJK composition with a real
+  input method, Wayland runs, lower-end hardware and GPU contention.
 - Detaching a result tab to its own OS window (9.2, Later): whether the
   second-`Root`-window technique is acceptable is a product call, to be made
   when the feature is scheduled.
