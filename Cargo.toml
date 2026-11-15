@@ -38,6 +38,7 @@ zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-cry
 # @NOTE: gpui-component pins gpui-pre exactly; both are pinned with `=` so the pair never drifts.
 gpui = { version = "=0.3.12", package = "gpui-pre" }
 gpui-component = "=0.9.1"
+gpui-kit-assets = "=0.9.1"
 gpui-platform = { version = "=0.3.12", package = "gpui-pre-platform" }
 
 [workspace.lints.rust]

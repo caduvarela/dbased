@@ -7,13 +7,21 @@ publish.workspace = true
 
 [dependencies]
 dbased-commands.workspace = true
+async-channel.workspace = true
 gpui.workspace = true
-gpui-component.workspace = true
+# @NOTE: tree-sitter-sql gives the editor SQL highlighting.
+gpui-component = { workspace = true, features = ["tree-sitter-sql"] }
+gpui-kit-assets.workspace = true
 gpui-platform.workspace = true
 
 # @NOTE: without a display backend feature GPUI silently starts headless and opens no window.
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui-platform = { workspace = true, features = ["wayland", "x11"] }
+
+[dev-dependencies]
+dbased-commands = { workspace = true, features = ["fake"] }
+gpui = { workspace = true, features = ["test-support"] }
+gpui-component = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
