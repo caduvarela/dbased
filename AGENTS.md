@@ -38,12 +38,23 @@ Hard rules (enforced by the compiler and checked with `cargo tree`):
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace                     # plain runner, no extra tools
+cargo nextest run --workspace              # preferred runner (profiles: default, ci)
+cargo test --workspace --doc               # doctests (nextest does not run them)
 cargo tree -p dbased-core | grep gpui      # must print nothing
 cargo tree -p dbased-ui | grep dbased-core # must print nothing
 ```
 
 Run fmt, clippy and tests before every commit. Rust toolchain is pinned in `rust-toolchain.toml`.
+
+Integration tests (real Postgres/MySQL via testcontainers) will live behind the `integration` cargo feature; it does not exist yet.
+
+Manual dev databases with sample data (never used by tests; see `dev/README.md`):
+
+```
+docker compose up -d     # Postgres on 127.0.0.1:54320, MySQL on 127.0.0.1:33060
+docker compose down -v   # stop and wipe data
+```
 
 ## Code rules
 
