@@ -1620,7 +1620,7 @@ Serves Simplicity, "No Magic", and data safety.
 tables need a deliberate opt-in. Both are documented limitations, not bugs, and
 keep destructive operations honest.
 
-### 2.7 SQL text handling: tokenizer plus parser *(new 2026-11)*
+### 2.7 SQL text handling: tokenizer plus parser *(new 2026-11, revised after spike)*
 
 **Decision.** SQL text is processed in two layers, both inside `core`:
 
@@ -1652,11 +1652,40 @@ Splitting responsibilities puts each need on the layer that fits it, and keeps
 the "ignore `::`, strings and dollar quotes" requirement in one tested place.
 Serves Maintainability and UX.
 
+**Spike outcome (2026-11).** `sqlparser`'s tokenizer (0.64) lexes clean text
+correctly but cannot be our base: it returns an error with **no partial
+tokens** on an unterminated string, quoted identifier, block comment or
+dollar quote (the normal state while typing, and one bad statement loses the
+whole script), and its locations count chars, not bytes. The spike suggested
+wrapping it for clean text plus a tolerant scanner for broken text; that is
+rejected because two lexers would give different splits for the same script
+depending on whether a quote is closed yet. The in-house scanner is the
+**only** lexer for split, cursor, parameters and navigation; it works in byte
+offsets; strings, comments and dollar quotes, the hard part, have to be
+tolerant anyway, and the rest is trivial. `sqlparser`'s tokenizer serves as a
+**test oracle** (differential tests on complete inputs). AST spans from
+`sqlparser` (9.5, error positions) are converted with a per-line char-to-byte
+table.
+
+Dialect rules the scanner must implement (confirmed or found by the spike):
+nested block comments in Postgres only; `#` comments and backtick
+identifiers in MySQL; `E''` strings and `$tag$` quotes in Postgres. To be
+covered by the test matrix as well: MySQL `--` needs a following whitespace,
+MySQL backslash escapes in strings, MySQL `/*! ... */` executable comments
+(treated as comments for splitting, as "may hide DDL" for 4.2). Splitting on
+top-level `;` is not enough: `BEGIN ... END` bodies in MySQL `CREATE
+PROCEDURE / FUNCTION / TRIGGER / EVENT` and Postgres `BEGIN ATOMIC` bodies
+are tracked as blocks (a bare `BEGIN;` is a transaction start), and MySQL's
+client-side `DELIMITER` directive is honored by a line-level pre-pass and never
+sent to the server.
+
 **Trade-off.** We own and must test a tokenizer. Its scope is intentionally
 small (no grammar), and its test matrix (table-driven with `rstest`, snapshot
 with `insta`) is the place where DBeaver-style parameter bugs are prevented.
-Behavior of `sqlparser`'s own tokenizer on `:name` and `?` is verified in the
-week-one spike (Part 10) before relying on it.
+Block tracking for compound bodies is the one piece that edges toward grammar;
+it is kept to `BEGIN`/`CASE` ... `END` nesting inside `CREATE` routine
+statements (where `END IF`, `END LOOP` and similar close their own
+constructs, not a `BEGIN`).
 
 ---
 
