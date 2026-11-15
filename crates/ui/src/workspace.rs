@@ -4,11 +4,11 @@ use dbased_commands::{Command, ConnectionId, Event, ResultId, TabId, UiLink};
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Sizable as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
+    button::{Button, ButtonVariant, ButtonVariants as _},
     dock::{DockArea, DockPlacement, DockSkin, PanelStyle, panel_handle},
     h_flex, v_flex,
 };
@@ -18,11 +18,13 @@ use crate::{
         CancelExecution, CloseActiveTab, NewTab, RUNNING_CONTEXT, RunAll, RunCurrent,
         WORKSPACE_CONTEXT,
     },
-    client::CommandSink,
+    client::{self, CommandSink},
+    connection_dialog::{self, ConnectionDialog},
     editor_panel::{EditorPanel, EditorPanelEvent, RunMode},
-    explorer_panel::ExplorerPanel,
+    explorer_panel::{ExplorerEvent, ExplorerPanel},
+    password_dialog::{self, PasswordDialog},
     results_panel::{ResultPanel, ResultsPlaceholder},
-    state::UiState,
+    state::{ConnectionForm, UiState},
 };
 
 const EXPLORER_WIDTH: f32 = 260.0;
@@ -40,6 +42,8 @@ pub struct Workspace {
     placeholder_shown: bool,
     editors: Vec<Entity<EditorPanel>>,
     results: Vec<Entity<ResultPanel>>,
+    connection_dialog: WeakEntity<ConnectionDialog>,
+    password_dialog: WeakEntity<PasswordDialog>,
     focus_handle: FocusHandle,
     subscriptions: Vec<Subscription>,
 }
@@ -74,8 +78,16 @@ impl Workspace {
         });
         let observe_state = cx.observe_in(&state, window, |workspace, _, window, cx| {
             workspace.sync_panels(window, cx);
+            workspace.sync_dialogs(window, cx);
             cx.notify();
         });
+        let observe_explorer = cx.subscribe_in(
+            &explorer,
+            window,
+            |workspace, _, event: &ExplorerEvent, window, cx| {
+                workspace.on_explorer_event(*event, window, cx);
+            },
+        );
         let workspace = Self {
             state,
             sink,
@@ -87,8 +99,10 @@ impl Workspace {
             placeholder_shown: true,
             editors: Vec::new(),
             results: Vec::new(),
+            connection_dialog: WeakEntity::new_invalid(),
+            password_dialog: WeakEntity::new_invalid(),
             focus_handle: cx.focus_handle(),
-            subscriptions: vec![observe_state],
+            subscriptions: vec![observe_state, observe_explorer],
         };
         workspace.pump_events(events, window, cx);
         workspace
@@ -102,6 +116,16 @@ impl Workspace {
     #[cfg(test)]
     pub fn explorer(&self) -> &Entity<ExplorerPanel> {
         &self.explorer
+    }
+
+    #[cfg(test)]
+    pub fn connection_dialog(&self) -> Option<Entity<ConnectionDialog>> {
+        self.connection_dialog.upgrade()
+    }
+
+    #[cfg(test)]
+    pub fn password_dialog(&self) -> Option<Entity<PasswordDialog>> {
+        self.password_dialog.upgrade()
     }
 
     #[cfg(test)]
@@ -206,17 +230,8 @@ impl Workspace {
         panel.update(cx, |panel, cx| panel.apply_window(start, rows, cx));
     }
 
-    /// Sends commands; a full or closed channel becomes a notice, never a freeze.
     fn dispatch(&mut self, commands: Vec<Command>, cx: &mut Context<Self>) {
-        for command in commands {
-            if let Err(failure) = self.sink.send(command) {
-                self.state.update(cx, |state, cx| {
-                    state.send_failed(failure);
-                    cx.notify();
-                });
-                return;
-            }
-        }
+        client::dispatch(&self.sink, &self.state, commands, cx);
     }
 
     /// Makes the panels match the state: one editor panel per tab, one result panel per
@@ -365,7 +380,107 @@ impl Workspace {
         });
     }
 
+    fn on_explorer_event(
+        &mut self,
+        event: ExplorerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ExplorerEvent::NewConnection => self.open_connection_dialog(None, window, cx),
+            ExplorerEvent::Edit(connection) => {
+                self.open_connection_dialog(Some(connection), window, cx);
+            }
+            ExplorerEvent::Delete(connection) => self.confirm_delete(connection, window, cx),
+            ExplorerEvent::Connect(connection) => self.connect(connection, cx),
+            ExplorerEvent::Disconnect(connection) => self.disconnect(connection, cx),
+        }
+    }
+
+    /// Opens the dialog the Core's events asked for. One password prompt at a time.
+    fn sync_dialogs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompting = self.state.read(cx).flow.password_prompt.is_some();
+        if !prompting || self.password_dialog.upgrade().is_some() {
+            return;
+        }
+        let opened = password_dialog::open(self.state.clone(), self.sink.clone(), window, cx);
+        if let Some(dialog) = opened {
+            self.password_dialog = dialog.downgrade();
+        }
+    }
+
     // User intents.
+
+    /// Opens the connection dialog: a new connection, or `editing`'s settings.
+    pub fn open_connection_dialog(
+        &mut self,
+        editing: Option<ConnectionId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let form = match editing {
+            None => ConnectionForm::new(),
+            Some(connection) => {
+                let state = self.state.read(cx);
+                let Some(summary) = state.connections.get(connection) else {
+                    return;
+                };
+                ConnectionForm::from_summary(summary)
+            }
+        };
+        let dialog =
+            connection_dialog::open(self.state.clone(), self.sink.clone(), form, window, cx);
+        self.connection_dialog = dialog.downgrade();
+    }
+
+    /// Asks before deleting; confirming closes the connection's tabs and deletes it.
+    pub fn confirm_delete(
+        &mut self,
+        connection: ConnectionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(confirmation) = self.state.read(cx).delete_confirmation(connection) else {
+            return;
+        };
+        let message = confirmation.message();
+        let state = self.state.clone();
+        let sink = self.sink.clone();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let state = state.clone();
+            let sink = sink.clone();
+            alert
+                .title("Delete connection")
+                .description(message.clone())
+                .confirm()
+                .ok_text("Delete")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, _, cx| {
+                    let commands = state.update(cx, |state, cx| {
+                        cx.notify();
+                        state.delete_connection(connection)
+                    });
+                    client::dispatch(&sink, &state, commands, cx);
+                    true
+                })
+        });
+    }
+
+    pub fn connect(&mut self, connection: ConnectionId, cx: &mut Context<Self>) {
+        let commands = self.state.update(cx, |state, cx| {
+            cx.notify();
+            state.connect(connection)
+        });
+        self.dispatch(commands, cx);
+    }
+
+    pub fn disconnect(&mut self, connection: ConnectionId, cx: &mut Context<Self>) {
+        let commands = self.state.update(cx, |state, cx| {
+            cx.notify();
+            state.disconnect(connection)
+        });
+        self.dispatch(commands, cx);
+    }
 
     pub fn run(&mut self, mode: RunMode, cx: &mut Context<Self>) {
         let Some(editor) = self.active_editor(cx) else {

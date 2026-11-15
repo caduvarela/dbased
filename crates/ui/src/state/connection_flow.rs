@@ -99,6 +99,13 @@ impl ConnectionFlow {
         self.save = SaveStatus::Idle;
     }
 
+    /// An edit makes the last test result stale; a test in flight is left alone.
+    pub fn clear_test_result(&mut self) {
+        if matches!(self.test, TestStatus::Success | TestStatus::Failed(_)) {
+            self.test = TestStatus::Idle;
+        }
+    }
+
     pub fn track(&mut self, request: RequestId, pending: Pending) {
         self.pending.insert(request, pending);
     }

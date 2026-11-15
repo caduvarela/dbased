@@ -10,7 +10,7 @@ use gpui_component::{Root, table::TableDelegate as _};
 use crate::{editor_panel::RunMode, init, state::TabStatus, workspace::Workspace};
 
 /// Opens a window on a fresh `FakeCore` and lets the first events through.
-fn launch(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+pub(crate) fn launch(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
     cx.update(init);
     let (ui_link, core_link) = bridge(COMMAND_CAPACITY, EVENT_CAPACITY);
     cx.executor()
