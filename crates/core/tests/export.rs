@@ -277,7 +277,7 @@ fn expected_row(g: u64) -> Vec<Field> {
     vec![
         text(g.to_string()),
         text(format!("name {g}")),
-        (g % 10 != 0).then(|| format!("v{g}")),
+        (!g.is_multiple_of(10)).then(|| format!("v{g}")),
         text(ratio),
         text(format!("2026-02-{:02}", 1 + g % 28)),
         text(moment),
