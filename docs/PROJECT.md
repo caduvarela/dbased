@@ -1836,9 +1836,11 @@ objects and eager loading would stall the connect. Serves Performance.
   2. **AST classification** of each statement with `sqlparser` (Postgres /
      MySQL dialect), yielding statement kind and target object so invalidation
      is **scoped** (just that table or schema node), not a full-tree reload.
-  3. **Server confirmation** where the driver exposes what it actually executed
-     (statement outcome / command tag), used to confirm a real schema change.
-     The parser is the primary signal if it is not cleanly available.
+  3. **Server confirmation: not available today.** It would use the command tag
+     the server returns, but sqlx's `QueryResult` exposes only `rows_affected`,
+     so no such signal exists and the classification in step 2 is the only
+     signal. Revisit only if a driver (for example a `tokio-postgres` Postgres
+     driver, see 1.2) exposes the command tag.
   4. **Conservative fallback.** Anything the parser cannot confidently classify,
      or constructs that can hide DDL (`DO $$ ... $$` blocks, `CALL` procedures,
      `EXECUTE` / dynamic SQL, parse failures on exotic syntax) is treated as
@@ -1950,7 +1952,12 @@ reasonably flat.
 rustls-with-native-roots feature, and `rustls-platform-verifier` where a
 non-sqlx path needs it). Connection settings expose the standard modes
 (`disable`, `prefer`, `require`, `verify-ca`, `verify-full`), a custom CA file,
-and client certificates. *(Spike, 2026-11.)* `tls-rustls-ring-native-roots`
+and client certificates. **The default for a new connection is `require`.**
+sqlx's own default on Postgres is `prefer`, which silently falls back to
+plaintext, so DBased always sets the mode explicitly and never inherits the
+library default. Choosing `prefer` or `disable` is an explicit user choice shown
+with a visible warning in the connection form and on the connection itself
+(No Magic: an unencrypted connection is never an accident). *(Spike, 2026-11.)* `tls-rustls-ring-native-roots`
 builds; `require` works on both databases and fails clearly against a server
 without TLS. Verification against native roots or a real CA bundle is
 **not yet tested** (the spike only had a self-signed certificate); this must
