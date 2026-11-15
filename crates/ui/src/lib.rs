@@ -1,6 +1,6 @@
 //! The only crate allowed to use GPUI. Talks to the core exclusively via `dbased-commands`.
 
-use gpui::{AppContext, TitlebarOptions, WindowOptions};
+use gpui::{AppContext, IntoElement, ParentElement, Styled, TitlebarOptions, WindowOptions};
 use gpui_component::Root;
 
 pub fn run() {
@@ -35,7 +35,13 @@ impl gpui::Render for EmptyView {
         &mut self,
         _window: &mut gpui::Window,
         _app: &mut gpui::Context<Self>,
-    ) -> impl gpui::IntoElement {
+    ) -> impl IntoElement {
+        // @TODO: replace with the real workspace shell.
         gpui::div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child("DBased")
     }
 }
