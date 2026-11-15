@@ -25,16 +25,23 @@ use crate::{
     ViewRef,
 };
 
-const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+use super::tests_session::{ScriptedSession, SessionLog};
+
+pub(super) const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct ScriptedDriver {
     closes: Arc<AtomicUsize>,
+    sessions: Arc<SessionLog>,
 }
 
 #[async_trait]
 impl Driver for ScriptedDriver {
     async fn open_session(&self) -> Result<Box<dyn Session>, CoreError> {
-        Err(CoreError::Unsupported("sessions in this scripted driver"))
+        self.sessions.opens.fetch_add(1, Ordering::SeqCst);
+        self.sessions.order.lock().unwrap().push("session_open");
+        Ok(Box::new(ScriptedSession {
+            log: self.sessions.clone(),
+        }))
     }
 
     async fn list_schemas(&self) -> Result<Vec<Schema>, CoreError> {
@@ -84,6 +91,7 @@ impl Driver for ScriptedDriver {
     }
 
     async fn close(&self) {
+        self.sessions.order.lock().unwrap().push("driver_close");
         self.closes.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -97,10 +105,11 @@ impl Driver for ScriptedDriver {
 }
 
 #[derive(Default)]
-struct ScriptedConnector {
-    connects: AtomicUsize,
-    closes: Arc<AtomicUsize>,
-    required_password: Option<&'static str>,
+pub(super) struct ScriptedConnector {
+    pub(super) connects: AtomicUsize,
+    pub(super) closes: Arc<AtomicUsize>,
+    pub(super) sessions: Arc<SessionLog>,
+    pub(super) required_password: Option<&'static str>,
 }
 
 #[async_trait]
@@ -118,27 +127,28 @@ impl DriverConnector for ScriptedConnector {
         }
         Ok(Arc::new(ScriptedDriver {
             closes: self.closes.clone(),
+            sessions: self.sessions.clone(),
         }))
     }
 }
 
-struct Harness {
-    commands: Sender<Command>,
-    events: Receiver<Event>,
+pub(super) struct Harness {
+    pub(super) commands: Sender<Command>,
+    pub(super) events: Receiver<Event>,
     core: JoinHandle<()>,
-    config_path: PathBuf,
-    secrets: Arc<InMemorySecretStore>,
-    connector: Arc<ScriptedConnector>,
+    pub(super) config_path: PathBuf,
+    pub(super) secrets: Arc<InMemorySecretStore>,
+    pub(super) connector: Arc<ScriptedConnector>,
     initial: Vec<ConnectionSummary>,
-    _directory: Option<tempfile::TempDir>,
+    pub(super) _directory: Option<tempfile::TempDir>,
 }
 
 impl Harness {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         Self::with_connector(ScriptedConnector::default()).await
     }
 
-    async fn with_connector(connector: ScriptedConnector) -> Self {
+    pub(super) async fn with_connector(connector: ScriptedConnector) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("dbased").join("config.toml");
         let mut harness = Self::start(
@@ -151,12 +161,21 @@ impl Harness {
         harness
     }
 
-    async fn start(
+    pub(super) async fn start(
         config_path: PathBuf,
         secrets: Arc<InMemorySecretStore>,
         connector: Arc<ScriptedConnector>,
     ) -> Self {
-        let (ui, link) = bridge(256, 1024);
+        Self::start_sized(config_path, secrets, connector, 1024).await
+    }
+
+    pub(super) async fn start_sized(
+        config_path: PathBuf,
+        secrets: Arc<InMemorySecretStore>,
+        connector: Arc<ScriptedConnector>,
+        event_capacity: usize,
+    ) -> Self {
+        let (ui, link) = bridge(256, event_capacity);
         let core = Core::new(CoreDependencies {
             connection_store: ConnectionStore::new(config_path.clone()),
             secret_store: secrets.clone(),
@@ -180,19 +199,19 @@ impl Harness {
         harness
     }
 
-    async fn next_event(&self) -> Event {
+    pub(super) async fn next_event(&self) -> Event {
         tokio::time::timeout(EVENT_TIMEOUT, self.events.recv())
             .await
             .expect("an event arrives in time")
             .expect("the event channel is open")
     }
 
-    async fn send(&self, command: Command) {
+    pub(super) async fn send(&self, command: Command) {
         self.commands.send(command).await.unwrap();
     }
 
     /// Events up to and including the terminal event of `request`.
-    async fn until_terminal(&self, request: RequestId) -> Vec<Event> {
+    pub(super) async fn until_terminal(&self, request: RequestId) -> Vec<Event> {
         let mut seen = Vec::new();
         loop {
             let event = self.next_event().await;
@@ -204,12 +223,17 @@ impl Harness {
         }
     }
 
-    async fn request(&self, command: Command, request: RequestId) -> Vec<Event> {
+    pub(super) async fn request(&self, command: Command, request: RequestId) -> Vec<Event> {
         self.send(command).await;
         self.until_terminal(request).await
     }
 
-    async fn save(&self, request: u64, id: Option<ConnectionId>, name: &str) -> ConnectionId {
+    pub(super) async fn save(
+        &self,
+        request: u64,
+        id: Option<ConnectionId>,
+        name: &str,
+    ) -> ConnectionId {
         let events = self
             .request(
                 Command::SaveConnection {
@@ -227,7 +251,12 @@ impl Harness {
         }
     }
 
-    async fn connect(&self, request: u64, id: ConnectionId, password: PasswordSource) -> Event {
+    pub(super) async fn connect(
+        &self,
+        request: u64,
+        id: ConnectionId,
+        password: PasswordSource,
+    ) -> Event {
         let events = self
             .request(
                 Command::Connect {
@@ -242,7 +271,7 @@ impl Harness {
     }
 
     /// Drops the command sender and waits for `Core::run` to return.
-    async fn shut_down(self) -> Vec<Event> {
+    pub(super) async fn shut_down(self) -> Vec<Event> {
         drop(self.commands);
         tokio::time::timeout(EVENT_TIMEOUT, self.core)
             .await
@@ -256,7 +285,7 @@ impl Harness {
     }
 }
 
-fn settings(name: &str) -> ConnectionSettings {
+pub(super) fn settings(name: &str) -> ConnectionSettings {
     ConnectionSettings {
         name: name.to_owned(),
         kind: DatabaseKind::Postgres,
@@ -268,7 +297,7 @@ fn settings(name: &str) -> ConnectionSettings {
     }
 }
 
-fn terminal_request(event: &Event) -> Option<RequestId> {
+pub(super) fn terminal_request(event: &Event) -> Option<RequestId> {
     match event {
         Event::ConnectionSaved { request, .. }
         | Event::RequestCompleted { request }
@@ -279,7 +308,7 @@ fn terminal_request(event: &Event) -> Option<RequestId> {
     }
 }
 
-fn failed_kind(event: &Event) -> ErrorKind {
+pub(super) fn failed_kind(event: &Event) -> ErrorKind {
     match event {
         Event::RequestFailed { error, .. } => error.kind,
         other => panic!("expected RequestFailed, got {other:?}"),
@@ -678,7 +707,7 @@ async fn metadata_requests_walk_the_tree() {
 }
 
 #[tokio::test]
-async fn execute_is_not_implemented_yet_and_still_ends_the_request() {
+async fn execute_on_an_unknown_tab_ends_the_request() {
     let harness = Harness::new().await;
     let events = harness
         .request(
@@ -691,7 +720,7 @@ async fn execute_is_not_implemented_yet_and_still_ends_the_request() {
             RequestId(1),
         )
         .await;
-    assert_eq!(failed_kind(&events[0]), ErrorKind::NotImplemented);
+    assert_eq!(failed_kind(&events[0]), ErrorKind::UnknownTab);
 }
 
 #[tokio::test]
