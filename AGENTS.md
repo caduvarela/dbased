@@ -58,7 +58,6 @@ Run fmt, clippy and tests before every commit. Rust toolchain is pinned in `rust
 
 - Conventional Commits (`feat(query): ...`, `fix(metadata): ...`, `docs(architecture): ...`). One logical change per commit, commit often.
 - One feature per pull request. Do not push or open PRs unless asked.
-- End commit messages with the attribution line given by the harness.
 
 ## Working style
 
