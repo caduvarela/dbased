@@ -1,0 +1,44 @@
+# Manual development databases only. Never used by automated tests
+# (those use testcontainers). Credentials are throwaway and dev-only.
+# Image versions and ports come from .env.
+name: dbased-dev
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    environment:
+      POSTGRES_USER: dbased
+      POSTGRES_PASSWORD: dbased
+      POSTGRES_DB: dbased_dev
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./dev/seed/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U dbased -d dbased_dev"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  mysql:
+    image: ${MYSQL_IMAGE}
+    environment:
+      MYSQL_ROOT_PASSWORD: dbased-root
+      MYSQL_USER: dbased
+      MYSQL_PASSWORD: dbased
+      MYSQL_DATABASE: dbased_dev
+    ports:
+      - "127.0.0.1:${MYSQL_HOST_PORT}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./dev/seed/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pdbased-root --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+volumes:
+  postgres_data:
+  mysql_data:

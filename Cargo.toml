@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/commands", "crates/core", "crates/ui", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+dbased-commands = { path = "crates/commands" }
+dbased-core = { path = "crates/core" }
+dbased-ui = { path = "crates/ui" }
+
+async-trait = "0.1"
+etcetera = "0.11"
+keyring-core = "1.0"
+serde = { version = "1", features = ["derive"] }
+sqlparser = "0.64"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "mysql", "sqlite"] }
+thiserror = "2"
+tokio = { version = "1.54", features = ["rt-multi-thread"] }
+toml = "1"
+tracing = "0.1"
+
+# @NOTE: platform credential stores for keyring-core; each is used only on its own OS (docs/PROJECT.md, 5.1).
+apple-native-keyring-store = "1.0"
+windows-native-keyring-store = "1.1"
+zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-crypto-rust"] }
+
+# @NOTE: gpui-component pins gpui-pre exactly; both are pinned with `=` so the pair never drifts.
+gpui = { version = "=0.3.12", package = "gpui-pre" }
+gpui-component = "=0.9.1"
+gpui-platform = { version = "=0.3.12", package = "gpui-pre-platform" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+# @TODO: remove once ui uses dbased-commands and app wires dbased-core (declared now to fix the dependency graph).
+[workspace.lints.cargo]
+unused_dependencies = "allow"
