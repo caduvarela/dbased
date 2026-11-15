@@ -8,8 +8,8 @@ use std::time::Duration;
 use dbased_commands::Value;
 use dbased_core::drivers::postgres::{PostgresDriver, TlsMode};
 use dbased_core::{
-    CloseReason, CoreError, Driver, DriverFactory, RowSink, Session, SessionHealth, SessionLimits,
-    StatementStatus, TableRef, UserSql,
+    CancelOutcome, CloseReason, CoreError, Driver, DriverFactory, RowSink, Session, SessionHealth,
+    SessionLimits, StatementStatus, TableRef, UserSql,
 };
 use secrecy::SecretString;
 use support::{TestDatabase, run, run_with};
@@ -648,4 +648,175 @@ async fn metadata_lists_schemas_tables_and_columns() {
         driver.list_routines("public").await,
         Err(CoreError::NotImplemented(_))
     ));
+}
+
+fn capped_config(
+    database: &TestDatabase,
+    max_rows: u64,
+) -> dbased_core::drivers::postgres::PostgresConfig {
+    let mut config = database.config();
+    config.limits = SessionLimits {
+        max_rows,
+        ..SessionLimits::default()
+    };
+    config
+}
+
+#[tokio::test]
+async fn a_row_cap_inside_a_transaction_keeps_the_users_update() {
+    let database = TestDatabase::create().await;
+    let (driver, mut session) = open_with(capped_config(&database, 100)).await;
+    run(&mut session, "CREATE TABLE t (id int, v int)").await;
+    run(&mut session, "INSERT INTO t VALUES (1, 1)").await;
+
+    run(&mut session, "BEGIN").await;
+    let updated = run(&mut session, "UPDATE t SET v = 2").await;
+    assert_eq!(updated.outcome.status, StatementStatus::Completed);
+    let capped = run(&mut session, "SELECT g FROM generate_series(1, 300000) g").await;
+
+    assert_eq!(capped.outcome.status, StatementStatus::Truncated);
+    assert!(capped.outcome.partial);
+    assert_eq!(capped.rows.len(), 100);
+    assert!(capped.outcome.cancel_error.is_none());
+    assert_eq!(capped.outcome.session, SessionHealth::Healthy);
+    let commit = run(&mut session, "COMMIT").await;
+    assert_eq!(commit.outcome.status, StatementStatus::Completed);
+
+    let other = driver.open_session().await.unwrap();
+    let mut other = other;
+    let value = run(&mut other, "SELECT v FROM t").await;
+    assert_eq!(value.rows, vec![vec![Value::Int(2)]]);
+}
+
+#[tokio::test]
+async fn a_row_cap_outside_a_transaction_still_cancels_after_commit_and_rollback() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open_with(capped_config(&database, 10)).await;
+    for closing in ["COMMIT", "ROLLBACK", "END", "ABORT"] {
+        run(&mut session, "BEGIN").await;
+        run(&mut session, closing).await;
+        let started = std::time::Instant::now();
+        let capped = run(
+            &mut session,
+            "SELECT g FROM generate_series(1, 100000000) g",
+        )
+        .await;
+        assert_eq!(
+            capped.outcome.status,
+            StatementStatus::Truncated,
+            "{closing}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{closing}: the cap should have cancelled instead of draining 100M rows"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_transaction_state_survives_begin_probing_over_many_rounds() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open_with(capped_config(&database, 5)).await;
+    run(&mut session, "CREATE TABLE t (v int)").await;
+    for round in 0..25 {
+        run(&mut session, "BEGIN").await;
+        run(&mut session, "INSERT INTO t VALUES (1)").await;
+        let capped = run(&mut session, "SELECT g FROM generate_series(1, 2000) g").await;
+        assert_eq!(capped.outcome.status, StatementStatus::Truncated, "{round}");
+        assert_eq!(capped.outcome.session, SessionHealth::Healthy, "{round}");
+        run(&mut session, "COMMIT").await;
+    }
+    let count = run(&mut session, "SELECT count(*) FROM t").await;
+    assert_eq!(count.rows, vec![vec![Value::Int(25)]]);
+}
+
+#[tokio::test]
+async fn a_dropped_receiver_inside_a_transaction_keeps_the_users_update() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+    run(&mut session, "CREATE TABLE t (v int)").await;
+    run(&mut session, "BEGIN").await;
+    run(&mut session, "INSERT INTO t VALUES (1)").await;
+
+    let (sink, receiver) = RowSink::channel(1);
+    drop(receiver);
+    let outcome = session
+        .execute(
+            UserSql::new("SELECT g FROM generate_series(1, 200000) g"),
+            sink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(outcome.partial);
+    assert_eq!(outcome.session, SessionHealth::Healthy);
+
+    run(&mut session, "COMMIT").await;
+    let count = run(&mut session, "SELECT count(*) FROM t").await;
+    assert_eq!(count.rows, vec![vec![Value::Int(1)]]);
+}
+
+#[tokio::test]
+async fn an_explicit_cancel_during_a_discard_still_cancels() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open_with(capped_config(&database, 10)).await;
+    run(&mut session, "BEGIN").await;
+
+    let token = CancellationToken::new();
+    cancel_after(&token, Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    let cancelled = run_with(
+        &mut session,
+        "SELECT g, pg_sleep(0.001) FROM generate_series(1, 100000) g",
+        token,
+    )
+    .await;
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(cancelled.outcome.status, StatementStatus::Cancelled);
+    assert_eq!(cancelled.outcome.session, SessionHealth::TransactionAborted);
+    run(&mut session, "ROLLBACK").await;
+    let alive = run(&mut session, "SELECT 1").await;
+    assert_eq!(alive.rows, vec![vec![Value::Int(1)]]);
+}
+
+#[tokio::test]
+async fn the_cancel_handle_cancels_a_running_statement() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+    let handle = session.cancel_handle();
+
+    let cancelling = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        handle.cancel().await
+    });
+    let started = std::time::Instant::now();
+    let result = run(&mut session, "SELECT pg_sleep(30)").await;
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(cancelling.await.unwrap().unwrap(), CancelOutcome::Sent);
+    let error = result.outcome.server_error.expect("57014");
+    assert_eq!(error.sqlstate, "57014");
+    assert_eq!(result.outcome.session, SessionHealth::Healthy);
+    let next = run(&mut session, "SELECT 1").await;
+    assert_eq!(next.rows, vec![vec![Value::Int(1)]]);
+}
+
+#[tokio::test]
+async fn a_cancel_handle_after_close_is_a_harmless_no_op() {
+    let database = TestDatabase::create().await;
+    let (driver, session) = open(&database).await;
+    let handle = session.cancel_handle();
+    let clone = handle.clone();
+    let id = session.session_id();
+    session.close().await;
+
+    assert_eq!(handle.cancel().await.unwrap(), CancelOutcome::SessionClosed);
+    assert_eq!(clone.cancel().await.unwrap(), CancelOutcome::SessionClosed);
+
+    // A stranger session keeps running; the closed handle never reaches it.
+    let mut stranger = driver.open_session().await.unwrap();
+    let result = run(&mut stranger, "SELECT pg_sleep(0.5), 1").await;
+    assert_eq!(result.outcome.status, StatementStatus::Completed);
+    assert!(id.0 > 0);
 }
