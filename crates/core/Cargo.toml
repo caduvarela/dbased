@@ -8,8 +8,19 @@ publish.workspace = true
 [dependencies]
 dbased-commands.workspace = true
 async-trait.workspace = true
+futures-util.workspace = true
+secrecy.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+testcontainers.workspace = true
+
+[features]
+# @NOTE: integration tests need a container runtime; plain `cargo test` must not.
+integration = []
 
 [lints]
 workspace = true
