@@ -92,6 +92,17 @@ reasoning kept, rather than deleted.
   - New: SQL formatting with portable, deterministic style files (9.6).
   - New: explain visualization over a common plan model, with rollback and
     confirmation for `EXPLAIN ANALYZE` of non-reads (9.7).
+- **2026-11 — Core service layer.** New Part 11 **(new 2026-11)**:
+  - The MVP `Command` / `Event` contract, UI-allocated request and tab ids,
+    one terminal event per request; serde leaves `commands`, passwords travel
+    as `SecretString`.
+  - The cross-seam channel is `async-channel` (runtime-agnostic, already in
+    the tree), refining 0.3; tokio channels stay inside `core`.
+  - Dispatcher plus one actor per tab; scripts are split in the Core, so only
+    single statements reach `raw_sql`; rows stay in the Core buffer and the
+    UI pulls windows; coalesced progress events; shutdown on channel close.
+  - A pure `FakeCore` behind a `commands` feature for UI work and tests; a
+    five-step implementation plan; product calls listed in Open decisions.
 
 ---
 
@@ -131,7 +142,8 @@ Principle
 Part 0, UI Platform · Part 1, Foundations · Part 2, The Data Path · Part 3,
 Jobs, Cancellation, Errors · Part 4, Metadata and Explorer · Part 5,
 Persistence and Security · Part 6, Frontend (GPUI) · Part 7, Testing ·
-Part 9, Editor and Session UX · Part 10, Week-One Spike · Open Decisions ·
+Part 9, Editor and Session UX · Part 10, Week-One Spike · Part 11, Core
+Service Layer · Open Decisions ·
 Part 8, Constitution and Philosophy Alignment
 
 ---
@@ -1192,10 +1204,11 @@ cheap insurance for the bet.
 **Decision.** Two async worlds coexist. The Core runs database I/O on its own
 multi-threaded `tokio` runtime (sqlx needs it). GPUI runs the UI event loop with
 its own executor on the main thread. They communicate by **bounded** channels
-(`tokio::sync::mpsc`): Core pushes progress/results onto a channel; the UI
-drains it using GPUI's background executor and applies changes to UI state by
-scheduling a closure on the GPUI event loop. Latest-state values (for example
-connection status) use `tokio::sync::watch`. The UI thread never blocks on
+(`async-channel`, runtime-agnostic, so `ui` needs no tokio; refined in 11.1):
+Core pushes progress/results onto a channel; the UI
+drains it with a task on the GPUI executor and applies changes to UI state on
+the GPUI event loop. Latest-state values (for example connection status)
+travel as events that carry the full new state (11.1). The UI thread never blocks on
 database work. (Exact GPUI APIs may shift while it is pre-1.0; the pattern,
 tokio for I/O plus event-loop hand-off for UI updates, is the stable part.)
 
@@ -2785,6 +2798,462 @@ discovering a grid or editor limit after the UI is built.
 
 ---
 
+## Part 11 — Core service layer *(new 2026-11)*
+
+The layer between the `commands` contract and the drivers: it owns
+connections, sessions and result buffers, turns `Command` values into driver
+calls, and turns driver results into `Event` values. Scope is the MVP slice
+only: connection CRUD, test, connect, disconnect; one session per tab;
+run-current, run-selection and run-all (9.2); streamed results paged from the
+Core buffer (2.3); cancel; lazy schema browse (4.1); the error shape (3.4).
+Not in this slice: metadata cache and DDL invalidation (4.2), table browse
+and editing (2.4, 2.6), export (3.3), parameters (9.3), session idle timeout
+(2.2), history, workspace and layout persistence (5.2). Each lands later as
+new variants and handlers, without reshaping what is below.
+
+### 11.1 The contract: `commands` types
+
+**Decision.** The contract crate defines ids, DTOs, `Command`, `Event` and the
+channel pair. It stays free of tokio, sqlx and gpui.
+
+Ids. Who allocates an id is fixed so neither side waits for the other:
+
+| Id | Allocated by | Shape | Lifetime |
+|---|---|---|---|
+| `ConnectionId` | Core (next = max + 1 in the config file) | `u64` | persistent |
+| `TabId` | UI (process-wide counter) | `u64` | process |
+| `RequestId` | UI (process-wide counter) | `u64` | process |
+| `ResultId` | derived | `{ request: RequestId, statement: u32 }` | until released |
+
+`RequestId` replaces the scaffold's `JobId`. The UI knows every id before the
+Core replies, so a reply is matched without a round trip. Every command that
+expects an answer carries a `RequestId`, and **each request ends with exactly
+one terminal event**: its specific success event or `RequestFailed`.
+
+DTOs (connection settings never travel as a URL, 2.2; passwords only as
+`secrecy::SecretString`, 5.1):
+
+```rust
+pub enum DatabaseKind { Postgres, MySql }
+pub enum TlsMode { Disable, Prefer, Require }      // verify-* arrive with 5.3
+
+pub struct ConnectionSettings {
+    pub name: String, pub kind: DatabaseKind,
+    pub host: String, pub port: u16, pub user: String, pub database: String,
+    pub tls: TlsMode,
+}
+pub struct ConnectionSummary { pub id: ConnectionId, pub settings: ConnectionSettings,
+                               pub password_saved: bool, pub state: ConnectionState }
+pub enum ConnectionState { Disconnected, Connecting, Connected }
+
+pub enum PasswordUpdate { Keep, Save(SecretString), Forget }   // SaveConnection
+pub enum PasswordSource { Saved, Typed(SecretString), None }  // Test / Connect
+
+pub enum ExecuteTarget {
+    Current { cursor: usize },                 // byte offset into `script`
+    Selection { start: usize, end: usize },    // byte range into `script`
+    All,
+}
+pub struct StatementSpan { pub index: u32, pub start: usize, pub end: usize } // bytes into `script`
+
+pub enum MetadataNode { Connection, Schema { schema: String },
+                        Table { schema: String, name: String } }
+pub enum MetadataItemKind { Schema, Table, View, Column { type_name: String, nullable: bool } }
+pub struct MetadataItem { pub kind: MetadataItemKind, pub name: String }
+
+pub enum SessionState { NotOpen, Open, TransactionAborted, Reset { reason: SessionResetReason } }
+pub enum SessionResetReason { DrainTimeout, HealthCheckFailed, ConnectionError, FutureDropped }
+
+pub enum ResultStatus { Completed, Failed, Cancelled, Truncated }   // mirrors StatementStatus
+pub struct ResultOutcome {
+    pub status: ResultStatus, pub rows_received: u64, pub rows_affected: Option<u64>,
+    pub partial: bool, pub error: Option<DatabaseError>, pub cancel_error: Option<String>,
+}
+pub enum ExecutionStatus { Completed, StoppedOnError { statement: u32 },
+                           Cancelled { statement: u32 }, Aborted { statement: u32, error: ErrorInfo } }
+
+pub struct DatabaseError { pub sqlstate: String, pub message: String, pub detail: Option<String>,
+                           pub hint: Option<String>, pub position: Option<u32> }
+pub struct ErrorInfo { pub kind: ErrorKind, pub message: String, pub database: Option<DatabaseError> }
+```
+
+`Value` and `ColumnMeta` stay as they are (2.5). `DatabaseError.position` is
+the server's 1-based character offset into the statement; the UI adds the
+statement's `StatementSpan.start` (converting characters to bytes on that
+statement's text) to underline it.
+
+Commands:
+
+```rust
+pub enum Command {
+    // Connections
+    SaveConnection   { request: RequestId, id: Option<ConnectionId>, settings: ConnectionSettings, password: PasswordUpdate },
+    DeleteConnection { request: RequestId, id: ConnectionId },
+    TestConnection   { request: RequestId, id: Option<ConnectionId>, settings: ConnectionSettings, password: PasswordSource },
+    Connect          { request: RequestId, id: ConnectionId, password: PasswordSource },
+    Disconnect       { request: RequestId, id: ConnectionId },
+    // Tabs and execution
+    OpenTab     { tab: TabId, connection: ConnectionId },
+    CloseTab    { tab: TabId },
+    Execute     { request: RequestId, tab: TabId, script: String, target: ExecuteTarget },
+    Cancel      { tab: TabId, request: RequestId },        // the Execute request to stop
+    FetchRows   { result: ResultId, start: u64, count: u32 },
+    ReleaseResult { result: ResultId },
+    // Metadata
+    LoadChildren { request: RequestId, connection: ConnectionId, node: MetadataNode },
+}
+```
+
+Events:
+
+```rust
+pub enum Event {
+    ConnectionsChanged { connections: Vec<ConnectionSummary> },     // full list, after load and every change
+    ConnectionStateChanged { id: ConnectionId, state: ConnectionState },
+    ConnectionSaved  { request: RequestId, id: ConnectionId },
+    RequestCompleted { request: RequestId },                        // delete, test, connect, disconnect
+    RequestFailed    { request: RequestId, error: ErrorInfo },
+    TabClosed        { tab: TabId },
+    SessionStateChanged { tab: TabId, state: SessionState },
+    ExecutionStarted  { request: RequestId, tab: TabId, statements: Vec<StatementSpan> },
+    ResultStarted     { result: ResultId, columns: Vec<ColumnMeta> },
+    ResultProgress    { result: ResultId, rows_buffered: u64 },
+    ResultFinished    { result: ResultId, outcome: ResultOutcome },
+    ExecutionFinished { request: RequestId, status: ExecutionStatus },
+    RowsWindow        { result: ResultId, start: u64, rows: Vec<Vec<Value>> },
+    ChildrenLoaded    { request: RequestId, connection: ConnectionId, node: MetadataNode, items: Vec<MetadataItem> },
+    Error             { error: ErrorInfo },                         // not tied to a request (startup, config file)
+}
+```
+
+Ordering guarantee per execution: `ExecutionStarted`, then per statement
+`ResultStarted` → `ResultProgress`* → `ResultFinished`, then
+`ExecutionFinished`. `RowsWindow` may interleave anywhere after its
+`ResultStarted`, and may hold fewer rows than asked while the result is still
+filling or at its end. A failed statement still gets `ResultStarted` (with
+empty columns) and a `ResultFinished` carrying the database error. Failures
+before any statement runs (unknown tab, tab busy, connect failure, empty
+script) end the request with `RequestFailed` instead.
+
+Derives and dependencies: `Command` derives `Debug` and `Clone` only
+(`SecretString` redacts itself in `Debug` and has no `PartialEq`); `Event` and
+the DTOs derive `Debug`, `Clone`, `PartialEq`. **The `serde` derives are
+removed** from `Command`, `Event` and the DTOs: there is no serialization
+boundary (0.2), and a secret must not become serializable by accident. A
+future IPC transport adds serialization deliberately, with secrets handled
+explicitly. `commands` gains `secrecy` and `async-channel` and drops `serde`
+(declared only where used).
+
+The channel pair lives in `commands`:
+
+```rust
+pub fn bridge(command_capacity: usize, event_capacity: usize) -> (UiLink, CoreLink);
+pub struct UiLink   { pub commands: async_channel::Sender<Command>, pub events: async_channel::Receiver<Event> }
+pub struct CoreLink { pub commands: async_channel::Receiver<Command>, pub events: async_channel::Sender<Event> }
+```
+
+Capacities: 256 commands, 1,024 events.
+
+**Why.** UI-allocated ids make every request fire-and-forget with reliable
+matching, and "one terminal event per request" lets the UI clear a spinner
+without guessing (No Magic). `async-channel` is runtime-agnostic, so `ui` can
+await it on GPUI's executor without depending on tokio (rule: tokio stays in
+`core` and `app`), and it is already in the dependency tree through the GPUI
+stack, so it adds no crate to the binary. Serves Maintainability and
+Technological Independence.
+
+**Trade-off.** This refines 0.3: the cross-seam channel is `async-channel`, not
+`tokio::sync::mpsc` (tokio channels stay inside `core`, for example
+`RowSink`). Dropping serde means an IPC transport later needs its own
+serialization work; that is the right place to decide how secrets cross it.
+
+### 11.2 Core runtime structure
+
+**Decision.** `core` exposes one entry point, `Core::new(dependencies)` and
+`Core::run(self, link: CoreLink)`, an async function the app spawns on the
+tokio runtime. Inside, state is owned by tasks (actors), not shared behind
+locks, with two narrow exceptions named below.
+
+```
+           CoreLink.commands
+                 │
+          ┌──────▼───────┐  owns: ConnectionStore, SecretStore,
+          │  Dispatcher  │        connections: HashMap<ConnectionId, ConnectionEntry>,
+          │  (one task)  │        tabs: HashMap<TabId, TabHandle>
+          └─┬────┬────┬──┘
+   spawns   │    │    │ sends TabMessage
+  ┌─────────▼┐ ┌─▼────▼──────┐
+  │ connect /│ │ Tab actor   │ one per open tab; owns Option<Box<dyn Session>>
+  │ metadata │ │ (one task)  │ runs Execute / ReleaseSession / Close in order
+  │  tasks   │ └─────────────┘
+  └──────────┘          all tasks ─────► CoreLink.events (cloned sender)
+```
+
+- **Dispatcher.** One task, one loop, `select!` over the command receiver and
+  an internal completion channel (connect finished, disconnect finished, tab
+  actor exited). It never awaits database I/O itself: anything slower than a
+  map lookup is spawned, and the result comes back as an internal message.
+  `ConnectionEntry { settings, state, driver: Option<Arc<dyn Driver>>,
+  waiting_executes: Vec<Execute> }`.
+- **Connect / test / metadata tasks.** Spawned per request, holding an
+  `Arc<dyn Driver>` (metadata runs on the pool, 2.2). Short metadata queries
+  are never cancelled; a reply that arrives after a disconnect is still sent
+  and the UI drops it by `RequestId` (3.2.4).
+- **Tab actor.** Owns the tab's session, opened lazily on its first execute
+  (2.2) and reopened on the next execute after a `Reset`. Messages:
+  `Execute`, `ReleaseSession { ack }` (cancel, drain, `close()`, keep the
+  tab), `Close` (same, then release the tab's results, emit `TabClosed`, exit).
+  An `Execute` while the tab is running fails with `TabBusy`: the UI disables
+  run while a run is in flight, and the Core never queues work the user cannot
+  see.
+- **Shared exception 1: running slot.** `TabHandle` holds
+  `Arc<Mutex<Option<(RequestId, CancellationToken)>>>`, set by the actor for
+  the duration of an execution. `Cancel` is served by the dispatcher straight
+  from this slot (the actor is busy inside `execute`, so a queued message
+  would arrive too late). A cancel for a request that is not running is a
+  no-op.
+- **Shared exception 2: result store.** `ResultStore =
+  Arc<Mutex<HashMap<ResultId, Arc<RwLock<ResultBuffer>>>>>`, where
+  `ResultBuffer { columns: Vec<ColumnMeta>, rows: Vec<Vec<Value>> }`. The tab
+  actor inserts a buffer **before** emitting `ResultStarted`, so a `FetchRows`
+  that follows the event always finds it. The dispatcher serves `FetchRows`
+  by cloning the requested rows under a read lock (at most one window, 200
+  rows by default). Locks are `std::sync` and never held across an `.await`;
+  a poisoned lock maps to an `Internal` error, never a panic.
+
+**Execution flow** (one `Execute` request, inside the tab actor):
+
+1. **Split, always in Core.** `dbased_sql::split_statements(script, dialect)`
+   with the dialect from the connection's `DatabaseKind`. `Current` picks
+   `dbased_sql::statement_at(&statements, cursor)`: the statement containing
+   the cursor, else the closest one before it, else the first after it (the
+   same function drives the editor's current-statement highlight, so what is
+   highlighted is what runs). `Selection` splits only the selected slice and
+   shifts spans back into script offsets. `All` takes every statement. No
+   statement found ends the request with `RequestFailed(EmptyScript)`.
+   **Only a single `Statement` text ever becomes a `UserSql`**; the raw script
+   never reaches a driver (3.2.4). `statement_at` is added to `dbased-sql`
+   with this slice.
+2. Emit `ExecutionStarted` with the planned spans. Set the running slot.
+3. For each statement, in order, with the one request token:
+   - Create `RowSink::channel(1_024)`; run `session.execute(sql, sink, token)`
+     and the **collector** together with `tokio::join!` (never `select!`, so
+     the execute future is never dropped, 1.2 rule 4).
+   - The collector reads the sink: on `Columns`, insert the buffer and emit
+     `ResultStarted`; on rows, `recv_many` up to 1,024 messages and append them
+     under one write lock; emit `ResultProgress` on the first rows and then
+     at most every 100 ms; on `Outcome`, stop.
+   - Emit `ResultFinished` with the mapped outcome and, when the session
+     health changed, `SessionStateChanged`. If the outcome says the session
+     was closed, call `close()` on it anyway (3.2.4: callers always close),
+     drop it, and emit `Reset`.
+   - Stop the script after `Failed` (9.2) or `Cancelled`; continue after
+     `Completed` and `Truncated` (a cap is not an error). An `Err` from
+     `execute` (session-level failure) stops with `Aborted`. An outcome with
+     `extra_statements_discarded` is a splitter bug: logged, reported as an
+     `Internal` error event, and covered by tests so it cannot ship.
+4. Clear the running slot, emit `ExecutionFinished`.
+
+**Batching and backpressure.** The driver applies the row and memory caps
+itself (2.3, `SessionLimits`, from settings; defaults until settings exist).
+The collector only appends to memory, so it keeps up with any network rate
+and the `RowSink` bound (1,024) only bites if the Core task is starved. The
+UI never receives rows by push: it gets a coalesced row count (at most 10
+`ResultProgress` per second per result) and pulls windows with `FetchRows`
+for the visible range (6.3). Event sends follow one rule: **progress events
+use `try_send` and are dropped when the event channel is full** (the next
+progress or `ResultFinished` carries the truth); every other event uses
+`send().await`. A stalled UI therefore never stalls a database read through
+progress, and request-reply traffic is bounded by what the UI asks for.
+
+**Results lifetime.** A result buffer lives until `ReleaseResult` or until its
+tab closes. The UI decides which result tabs to keep (pinning, 9.2) and
+releases the rest when it replaces them. Caps are per result (2.3); a total
+budget across results is not in this slice (see Open decisions).
+
+**Connections.** `Connect` with `PasswordSource::Saved` reads the keychain on
+`spawn_blocking` (5.1); no saved password, or a locked or unavailable store,
+ends the request with `PasswordRequired` so the UI can prompt and resend with
+`Typed`. `Execute` on a tab whose connection is disconnected **connects
+first** with the saved password: the execute waits in `waiting_executes`, the
+UI sees `ConnectionStateChanged { Connecting }`, and a connect failure ends
+the execute with that error (the state change is visible, so this is not
+hidden magic). `Disconnect` sends `ReleaseSession` to every tab of the
+connection, waits for all acks (cancel uses the pool, so the pool must
+outlive the sessions), then calls `Driver::close()`, emits `Disconnected` and
+`RequestCompleted`; tabs stay open with `SessionState::NotOpen`.
+`DeleteConnection` disconnects, closes the connection's tabs (`TabClosed`
+each), removes the entry and the keychain secret, then emits
+`ConnectionsChanged`; the UI asks the user before sending it. `TestConnection`
+connects a throwaway driver, runs nothing else, and closes it. A MySQL
+connection returns `NotImplemented` until the MySQL driver lands.
+
+**Shutdown.** The command channel closing (every `UiLink` sender dropped) is
+the shutdown signal; there is no `Shutdown` command to forget. The dispatcher
+then disconnects every connection as above (cancel, drain, `close()` on every
+session, then `Driver::close()` on every pool) and returns. Shutdown is the
+only path out of `Core::run`, so `close()` is never skipped by a normal exit.
+
+`Driver` gains `async fn close(&self)` (closes the pool). The general
+`JobRegistry` of 3.1 is not built in this slice: the running slot is the job
+state of an execution, and metadata requests are not cancellable. It arrives
+with export (3.3), the first job that is neither.
+
+Persistence in this slice: `ConnectionStore` (the `[[connections]]` table of
+the TOML config file, 5.2, atomic replace, path injected) and a
+`SecretStore` trait (`get`, `set`, `delete` keyed by `ConnectionId`) with a
+keyring implementation (5.1) and an in-memory one for tests. Both are
+injected through `CoreDependencies`; nothing is a process-wide default.
+
+**Errors (3.4).** `CoreError` stays the single error enum and grows the
+service variants: `PasswordRequired`, `UnknownConnection`, `UnknownTab`,
+`TabBusy`, `EmptyScript`, `Storage(String)`, `SecretStore(String)`,
+`Internal(String)`. `ErrorKind` in `commands` has one variant per `CoreError`
+variant, and one function in `core`, `fn error_info(&CoreError) -> ErrorInfo`, is
+the only mapping. Messages
+come from `Display`, which never includes secrets or user SQL (`UserSql` does
+not print, 1.2).
+
+**Why.** One owner per piece of state, with messages between owners, needs no
+locks except the two named, and makes ordering explicit (the dispatcher never
+waits on a database, a tab never runs two things at once, which is the
+session model of 2.2 and 9.1). Splitting in the Core turns "never send a
+multi-statement string to `raw_sql`" from a caller convention into a
+property of the only code path that builds `UserSql` from a script. Pull-based
+windows keep bulk rows in Core memory (6.2) and keep event volume
+independent of row rate. Serves Performance, No Magic, Maintainability.
+
+**Trade-off.** Two shared structures under locks instead of pure message
+passing; accepted because routing `Cancel` and `FetchRows` through a busy
+actor would make cancel late and scrolling stall during a long statement.
+Auto-connect on execute is a small state machine in the dispatcher.
+Per-result caps allow several large results to coexist in memory.
+
+### 11.3 App wiring
+
+**Decision.** `app` builds the multi-thread tokio runtime, creates the bridge,
+spawns the Core on the runtime, and hands the UI end to GPUI:
+
+```rust
+fn main() -> ExitCode {
+    let runtime = /* tokio multi-thread runtime; error → ExitCode::FAILURE */;
+    let (ui_link, core_link) = dbased_commands::bridge(256, 1_024);
+    let core = /* Core::new(CoreDependencies { config path (etcetera), keyring SecretStore, settings }) */;
+    let core_task = runtime.spawn(core.run(core_link));
+    dbased_ui::run(ui_link);                       // returns when GPUI quits
+    // UiLink was dropped with the GPUI app: the Core sees the closed channel and shuts down.
+    runtime.block_on(tokio::time::timeout(SHUTDOWN_BUDGET, core_task));
+    ExitCode::SUCCESS
+}
+```
+
+The parking thread in today's `main` goes away: a multi-thread runtime runs
+spawned tasks on its own workers without `block_on`. `SHUTDOWN_BUDGET` is the
+drain timeout plus a margin (12 s by default); after it the process exits and
+the servers see the sockets close.
+
+In `ui`, `run(link)` stores the command sender in a `CoreClient` entity (it
+also allocates `TabId` and `RequestId`) and starts one foreground task that
+awaits `link.events.recv()`, then drains whatever else is ready with
+`try_recv`, and applies the whole batch in one `update` (one notify per batch,
+not per event). The UI sends with `try_send`, never blocking; a full command
+channel shows "the Core is not responding" instead of freezing. `ui` still
+depends only on `commands`; `cargo tree` checks are unchanged.
+
+**Why.** Keeps tokio and sqlx out of `ui` and keeps `app` a dozen lines of
+wiring (1.3). Closing the channel as the shutdown signal works whatever the
+platform does on quit. Serves Technological Independence and UX (the UI never
+blocks).
+
+**Trade-off.** Whether GPUI's `run` returns after quit may differ by
+platform (verify on macOS and Windows when those targets are first built).
+Where it does not return, the process exits without the clean shutdown and
+the servers see the sockets close, as after a crash. The fix, if needed, is a
+quit hook in `ui` that drops the `UiLink` and waits, within the same budget,
+for a "Core stopped" signal that `app` passes in.
+
+### 11.4 Fake Core for UI development and tests
+
+**Decision.** A channel-level fake, not a trait. `commands` gets a `fake`
+cargo feature with `FakeCore`, a **pure, synchronous state machine**:
+`fn handle(&mut self, command: Command) -> Vec<Event>`, plus a
+runtime-agnostic `async fn serve(self, link: CoreLink)` loop. It holds two
+fake connections with a small fixed catalog and answers every command with
+the same event sequences and ordering guarantees as the real Core (11.1).
+Scripts drive behavior by plain text, so UI tests read naturally:
+
+- `select <n>` → one result with fixed columns and `n` rows computed on
+  demand from the row index (deterministic values covering every `Value`
+  variant, nothing stored), served by `FetchRows` like the real buffer; `n`
+  up to the 5,000,000 rows of Part 10.
+- `fail` → a `Failed` result with a `DatabaseError` carrying a position.
+- `sleep` → the statement stays running until `Cancel`, then `Cancelled`.
+- several statements → split with `dbased-sql` (an optional dependency
+  enabled by `fake`), one result each, stopping at `fail`.
+
+No timers: time never passes inside the fake, so `#[gpui::test]` runs stay
+deterministic (7.1). UI tests construct the bridge, run `serve` on the test
+executor, and drive the real UI. For manual UI work, `app` has a `fake-core`
+cargo feature (off by default, never in release builds) that serves
+`FakeCore` instead of starting the real Core.
+
+**Why.** A fake at the channel exercises exactly the seam the UI uses, so the
+UI cannot depend on anything the real Core does not provide. A pure state
+machine needs no runtime and is trivially deterministic. Putting it in
+`commands` lets `core` run the same scripted command sequences against both
+and compare event shapes (a contract test), which keeps the fake honest.
+
+**Trade-off.** The contract crate carries a test double behind a feature, and
+the fake must be kept in step with Core behavior; the contract test is what
+catches drift.
+
+### 11.5 Implementation plan
+
+Each step is one pull request, reviewable alone, with its acceptance tests.
+Steps 2 and 3 can run in parallel with the UI shell once step 1 is merged.
+
+1. **Contract.** Ids, DTOs, `Command`, `Event`, `ErrorKind` / `ErrorInfo`,
+   `bridge()`; drop serde, add `secrecy` and `async-channel` to `commands`.
+   *Tests:* `Debug` of a `Command` with a typed password does not contain it;
+   bridge round trip; closing every sender ends the receiver. `cargo tree`
+   rules hold.
+2. **Fake Core** (`fake` feature). *Tests:* table-driven scripts →
+   expected event sequences (ordering guarantee, one terminal event per
+   request, `RowsWindow` bounds at start, middle and end, `sleep` + `Cancel`,
+   `fail` with position, `TabBusy`).
+3. **Service skeleton: connections and metadata.** `Core::run`, dispatcher,
+   `ConnectionStore` (TOML, atomic write) and `SecretStore` (in-memory
+   implementation), Save / Delete / Test / Connect / Disconnect, `LoadChildren`,
+   `Driver::close()`, `CoreError` service variants and the single error
+   mapping, shutdown on channel close. *Tests:* unit tests with a hand-written
+   fake `Driver` (Part 7): CRUD round trip through a temp-dir config file,
+   `PasswordRequired` path, metadata replies, every `CoreError` variant maps
+   to its `ErrorKind`; integration (Postgres): connect, list schemas and
+   tables, disconnect closes the pool.
+4. **Execution.** Tab actors, `statement_at` in `dbased-sql`, splitting,
+   result store, collector batching, `FetchRows`, `ReleaseResult`, `Cancel`,
+   `CloseTab`, auto-connect on execute, session state events. *Tests:* fake
+   `Session` (scripted outcomes, counts `close()` calls): two statements give
+   two results in order; `Current` runs only the statement under the cursor;
+   stop after `Failed`, continue after `Truncated`; cancel stops the script;
+   closing a tab mid-run drains and calls `close()`; dropping the command
+   sender with running tabs calls `close()` on every session; progress events
+   are dropped, not awaited, when the event channel is full. Integration
+   (Postgres): `SELECT 1; DROP TABLE t` with `Current` on the first statement
+   leaves `t` in place; cancel of `pg_sleep` in a script; error position
+   maps into the script.
+5. **Keyring and app wiring.** Keyring `SecretStore` (5.1), config path via
+   `etcetera`, `main` as in 11.3, `ui::run(link)` with the event pump and
+   `CoreClient`, the `fake-core` feature. *Tests:* contract test (same
+   scripts against `FakeCore` and the real Core with fake drivers, same event
+   shapes); manual: the app starts, connects to the dev compose Postgres, runs
+   a script, quits cleanly (sessions gone from `pg_stat_activity`).
+
+Then, outside this plan: metadata cache and DDL invalidation (4.2), session
+idle timeout (2.2), the MySQL driver, history.
+
+---
+
 ## Open decisions
 
 ### Resolved
@@ -2856,6 +3325,24 @@ fallback paths (a wrapped or custom editor element) remain available.
 - Detaching a result tab to its own OS window (9.2, Later): whether the
   second-`Root`-window technique is acceptable is a product call, to be made
   when the feature is scheduled.
+- **Core service (Part 11), product calls.** The spec assumes the
+  recommendation in each case; a different answer changes only the named
+  handler.
+  - *Run in a disconnected tab:* connect automatically with the saved
+    password, showing "Connecting" (recommended, DBeaver-like), or fail with
+    "not connected" and make the user connect first.
+  - *Re-running in a tab:* replace the tab's unpinned result tabs and release
+    their buffers (recommended), or keep every result until closed by hand.
+  - *Memory across results:* the 2.3 caps apply per result, so several large
+    results can coexist. Recommended for the MVP: keep per-result caps and
+    show total result memory in the status bar; add a global budget only if
+    real use shows a need.
+  - *Run-all after a truncated statement:* continue with the next statement
+    (recommended; a cap is not an error) or stop.
+  - *Deleting a connection with open tabs:* ask, then close those tabs
+    (recommended), or refuse until the tabs are closed.
+  - *"Save password" in the connection form:* checked by default
+    (recommended; stored in the OS keychain, 5.1) or unchecked.
 
 ---
 
