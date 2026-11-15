@@ -31,6 +31,8 @@ apple-native-keyring-store.workspace = true
 windows-native-keyring-store.workspace = true
 
 [dev-dependencies]
+# @NOTE: the contract test runs the FakeCore against the real Core (docs/PROJECT.md 11.4).
+dbased-commands = { workspace = true, features = ["fake"] }
 tempfile.workspace = true
 testcontainers.workspace = true
 
