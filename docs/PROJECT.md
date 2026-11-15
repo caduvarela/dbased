@@ -2843,13 +2843,16 @@ philosophy are named out loud rather than hidden.
 - **Hidden Power.** The all-columns edit (2.6) is power kept behind an explicit
   opt-in rather than on the surface. The command palette (a Constitution item)
   is the main vehicle here and remains a UI-design task, not yet a locked
-  decision.
+  decision. Later: the step-by-step debug mode (9.5), smart multi-cursor
+  (9.4.1) and explain visualization (9.7).
 - **No Magic / explicit over implicit.** 2.5 (faithful values, `Unknown`
   fallback, never silent corruption), 2.6 (previewable SQL, explicit opt-in, no
   silent multi-row writes), 0.2 (explicit command/event boundary even in-process),
   3.2 ("cancelled" is recorded by the Core, never inferred; a session reset is
-  shown, an aborted transaction is reported rather than silently rolled back).
-  Tension named below.
+  shown, an aborted transaction is reported rather than silently rolled back),
+  9.5 and 9.7 (generated SQL shown before it runs, writes only by explicit
+  confirmation), 9.6 (formatting only on command, never on save or run).
+  Tensions named below.
 - **Maintainability.** 1.3 (workspace physically enforces independence), 2.1
   (driver trait, no giant match), 2.7 (each SQL need on the layer that fits it),
   3.4 (typed error categories), Part 7 (Core testable without UI), 0.1 and 0.2
