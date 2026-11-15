@@ -2,13 +2,17 @@
 
 mod actions;
 mod client;
+mod connection_dialog;
 mod editor_panel;
 mod explorer_panel;
 mod grid;
+mod password_dialog;
 mod results_panel;
 mod state;
 mod workspace;
 
+#[cfg(test)]
+mod connection_tests;
 #[cfg(test)]
 mod tests;
 

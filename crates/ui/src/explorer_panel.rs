@@ -1,12 +1,13 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use dbased_commands::ConnectionState;
+use dbased_commands::{ConnectionId, ConnectionState};
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
     ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _,
+    ActiveTheme as _, Disableable as _, Sizable as _,
+    button::{Button, ButtonVariants as _},
     dock::{BasePanel, Panel, PanelEvent},
     h_flex,
     list::ListItem,
@@ -28,6 +29,16 @@ struct RowInfo {
     online: bool,
 }
 
+/// What the user asked of a connection; the workspace carries it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplorerEvent {
+    NewConnection,
+    Edit(ConnectionId),
+    Delete(ConnectionId),
+    Connect(ConnectionId),
+    Disconnect(ConnectionId),
+}
+
 type RowTable = Rc<RefCell<HashMap<SharedString, RowInfo>>>;
 
 /// Connection and schema tree (docs/PROJECT.md 4.1): children load when a node expands.
@@ -40,6 +51,7 @@ pub struct ExplorerPanel {
     focus_handle: FocusHandle,
     _observe_state: Subscription,
     _observe_tree: Subscription,
+    _observe_selection: Subscription,
 }
 
 impl ExplorerPanel {
@@ -49,6 +61,8 @@ impl ExplorerPanel {
         let observe_tree = cx.subscribe(&tree, |panel, _, event: &TreeEvent, cx| {
             panel.on_tree_event(event, cx);
         });
+        // @NOTE: selecting a row only notifies the tree, and the toolbar follows the selection.
+        let observe_selection = cx.observe(&tree, |_, _, cx| cx.notify());
         let mut panel = Self {
             state,
             sink,
@@ -58,6 +72,7 @@ impl ExplorerPanel {
             focus_handle: cx.focus_handle(),
             _observe_state: observe_state,
             _observe_tree: observe_tree,
+            _observe_selection: observe_selection,
         };
         panel.rebuild(cx);
         panel
@@ -76,6 +91,83 @@ impl ExplorerPanel {
     #[cfg(test)]
     pub fn tree(&self) -> &Entity<TreeState> {
         &self.tree
+    }
+
+    /// The connection the selected row belongs to.
+    pub fn selected_connection(&self, cx: &App) -> Option<ConnectionId> {
+        let item = self.tree.read(cx).selected_item()?;
+        Some(self.keys.get(&item.id)?.connection())
+    }
+
+    fn emit_for_selection(
+        &mut self,
+        event: impl Fn(ConnectionId) -> ExplorerEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(connection) = self.selected_connection(cx) {
+            cx.emit(event(connection));
+        }
+    }
+
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let selected = self.selected_connection(cx);
+        let state = self.state.read(cx).connections.state_of(selected);
+        let connected = state == Some(ConnectionState::Connected);
+        let has_selection = selected.is_some();
+        let connection_toggle = if connected {
+            Button::new("disconnect-connection")
+                .label("Disconnect")
+                .tooltip("Close the selected connection")
+                .on_click(cx.listener(|panel, _, _, cx| {
+                    panel.emit_for_selection(ExplorerEvent::Disconnect, cx);
+                }))
+        } else {
+            Button::new("connect-connection")
+                .label("Connect")
+                .tooltip("Connect the selected connection")
+                .on_click(cx.listener(|panel, _, _, cx| {
+                    panel.emit_for_selection(ExplorerEvent::Connect, cx);
+                }))
+        };
+        h_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .flex_wrap()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                Button::new("new-connection")
+                    .label("New connection")
+                    .small()
+                    .primary()
+                    .tooltip("Add a connection")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ExplorerEvent::NewConnection))),
+            )
+            .child(connection_toggle.small().ghost().disabled(!has_selection))
+            .child(
+                Button::new("edit-connection")
+                    .label("Edit")
+                    .small()
+                    .ghost()
+                    .disabled(!has_selection)
+                    .tooltip("Edit the selected connection")
+                    .on_click(cx.listener(|panel, _, _, cx| {
+                        panel.emit_for_selection(ExplorerEvent::Edit, cx);
+                    })),
+            )
+            .child(
+                Button::new("delete-connection")
+                    .label("Delete")
+                    .small()
+                    .ghost()
+                    .disabled(!has_selection)
+                    .tooltip("Delete the selected connection")
+                    .on_click(cx.listener(|panel, _, _, cx| {
+                        panel.emit_for_selection(ExplorerEvent::Delete, cx);
+                    })),
+            )
+            .into_any_element()
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -168,6 +260,7 @@ fn row_info(node: &ExplorerNode) -> RowInfo {
 }
 
 impl EventEmitter<PanelEvent> for ExplorerPanel {}
+impl EventEmitter<ExplorerEvent> for ExplorerPanel {}
 
 impl Focusable for ExplorerPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -256,9 +349,11 @@ impl Render for ExplorerPanel {
             })
             .into_any_element()
         };
+        let toolbar = self.render_toolbar(cx);
         v_flex()
             .size_full()
             .bg(cx.theme().sidebar)
+            .child(toolbar)
             .child(div().flex_1().min_h_0().child(body))
     }
 }

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use dbased_commands::{Command, ConnectionId, Event, ExecuteTarget, RequestId, ResultId, TabId};
 
 use super::{
+    connection_flow::{ConnectionFlow, Outcome, PendingExecute},
     connections::ConnectionsModel,
     explorer::{ExplorerModel, NodeKey},
     ids::IdAllocator,
@@ -26,6 +27,7 @@ pub struct UiState {
     pub connections: ConnectionsModel,
     pub explorer: ExplorerModel,
     pub tabs: TabsModel,
+    pub flow: ConnectionFlow,
     results: HashMap<ResultId, ResultModel>,
     /// The latest problem worth telling the user about.
     pub notice: Option<String>,
@@ -141,6 +143,14 @@ impl UiState {
         if model.activity.is_busy() {
             return Vec::new();
         }
+        self.flow.track_execute(
+            request,
+            PendingExecute {
+                tab,
+                script: script.clone(),
+                target,
+            },
+        );
         let stale = std::mem::take(&mut model.results);
         model.statements.clear();
         model.last_run = None;
@@ -200,7 +210,11 @@ impl UiState {
                 }
                 Vec::new()
             }
-            Event::ConnectionSaved { .. } | Event::RequestCompleted { .. } => Vec::new(),
+            Event::ConnectionSaved { request, id } => {
+                self.flow.saved(request, id);
+                Vec::new()
+            }
+            Event::RequestCompleted { request } => self.connection_request_completed(request),
             Event::RequestFailed { request, error } => {
                 self.request_failed(request, error);
                 Vec::new()
@@ -244,6 +258,7 @@ impl UiState {
                 Vec::new()
             }
             Event::ExecutionFinished { request, status } => {
+                self.flow.take_execute(request);
                 if let Some(model) = self.tabs.by_request_mut(request) {
                     model.activity = Activity::Idle;
                     model.last_run = Some(LastRun::from_status(&status));
@@ -288,7 +303,24 @@ impl UiState {
     }
 
     fn request_failed(&mut self, request: RequestId, error: dbased_commands::ErrorInfo) {
+        match self.flow.failed(request, &error) {
+            Some(Outcome::Notice(message)) => self.notice = Some(message),
+            Some(_) => {}
+            None => self.execution_request_failed(request, error),
+        }
+    }
+
+    fn execution_request_failed(&mut self, request: RequestId, error: dbased_commands::ErrorInfo) {
+        let execute = self.flow.take_execute(request);
         if let Some(model) = self.tabs.by_request_mut(request) {
+            if error.kind == dbased_commands::ErrorKind::PasswordRequired
+                && let Some(execute) = execute
+            {
+                model.activity = Activity::Idle;
+                let connection = model.connection;
+                self.flow.ask_password(connection, Some(execute));
+                return;
+            }
             model.activity = Activity::Idle;
             model.last_run = Some(LastRun::Failed {
                 message: error.message,
@@ -329,6 +361,8 @@ impl UiState {
             .insert(result, ResultModel::new(result, tab_id, columns));
     }
 }
+
+mod connection_intents;
 
 #[cfg(test)]
 mod tests;

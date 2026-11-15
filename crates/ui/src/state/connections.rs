@@ -21,6 +21,10 @@ impl ConnectionsModel {
         self.items.iter().find(|item| item.id == id)
     }
 
+    pub fn state_of(&self, id: Option<ConnectionId>) -> Option<ConnectionState> {
+        self.get(id?).map(|connection| connection.state)
+    }
+
     pub fn items(&self) -> &[ConnectionSummary] {
         &self.items
     }
