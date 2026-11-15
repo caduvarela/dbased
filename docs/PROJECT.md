@@ -85,6 +85,8 @@ reasoning kept, rather than deleted.
     the upstream gap list (9.4, OPEN-6).
   - Smart multi-cursor, syntax-aware, on by default; the scanner will move to
     a shared pure crate (9.4.1, 1.3, 2.7).
+  - Fragment debugging grows into a step-by-step debug mode with a block
+    tree, per-step row counts and read-only safety (9.5).
 
 ---
 
@@ -2470,21 +2472,58 @@ literal than the upstream action (tension with No Magic, Part 8); the rule is
 simple, the fallback is the plain behavior, and the setting turns it off. A
 new crate, justified by the dependency rule rather than by size.
 
-### 9.5 Nested-query fragment debugging (Later)
+### 9.5 Step-by-step query debugging (Later; best differentiator candidate) *(revised 2026-11, editor UX)*
 
-**Decision (future).** Allow executing a fragment of a query in isolation: a
-selected subquery, or a single CTE from a `WITH` chain, to inspect intermediate
-results while debugging nested queries. Enabled by the parser layer already
-required elsewhere (2.7, 4.2): identify CTEs and subqueries, then rewrite to run
-only the chosen layer (for example `WITH a AS (...) SELECT * FROM a`). Not MVP;
-recorded so the architecture anticipates it. When the statement does not parse,
-the feature is simply unavailable for it.
+**Decision (future).** A debug mode for large nested and legacy queries: test
+them step by step, block by block, without rewriting them by hand.
 
-**Why.** Hidden Power for advanced users, at near-zero marginal cost because the
-parser is already in the stack.
+- **Block tree.** The Core parses the statement with `sqlparser` (2.7) and
+  builds a tree of query blocks: CTEs, sub-queries in `FROM`, `WHERE` and the
+  select list, and set-operation branches. AST spans are converted from chars
+  to bytes (2.7) to map each block to its text. If the statement does not
+  parse, the mode is simply unavailable for it.
+- **Outline and isolated runs.** An outline panel shows the tree. Any node can
+  be run alone: the Core rewrites the SQL to that node plus only the
+  dependencies it needs (for example `WITH a AS (...), b AS (...) SELECT * FROM
+  b`), and the generated SQL is **always shown before it runs** (No Magic).
+- **Row counts per step.** Each node can show rows in and rows out, which
+  finds the step where rows disappear: the differentiator. Counts run on
+  request (a count over the node), as cancellable jobs (3.1, 3.2).
+- **Per-node cache.** Results are kept per node, keyed by the node's
+  generated SQL and parameter values, labeled with when they ran, and never
+  reused after the text changes.
+- **Correlated sub-queries** cannot run alone. They are marked "not runnable
+  in isolation", or the user picks a row of the outer block and its values
+  bind as parameters. Detection is best-effort: a qualified reference to an
+  outer alias is certain, an unqualified column is ambiguous without the
+  catalog, and a server "unknown column" error is reported as "probably
+  correlated".
+- **Safety.** A CTE can modify data (Postgres `WITH x AS (INSERT ... RETURNING
+  ...)`). Any node that is not a pure read is refused before it runs (AST
+  check), and fragments run inside a `READ ONLY` transaction as a second guard
+  (it also stops functions that write). Fragments run on the tab's session
+  (2.2) so temp tables and settings apply; if that session is inside a user
+  transaction, the mode does not open its own and refuses to run.
+- **Cost.** Each step re-runs its upstream steps, so results use a visible,
+  configurable row limit. Optionally a node can be materialized into a temp
+  table on the tab's session; that is a write, so it is opt-in, previewed and
+  explicit.
+- **Parameters** (9.3) carry through to every generated fragment.
 
-**Trade-off.** Fragment rewriting has dialect edge cases; deferred until the core
-loop is solid.
+Phasing: (1) CTE chains without correlation; (2) general sub-queries,
+correlation by picked outer row; (3) per-step plans with 9.7; later, predicate
+bisection ("why zero rows": drop `WHERE` predicates one at a time to find the
+one that removes every row).
+
+**Why.** Large companies run huge legacy SQL with many nested blocks, and
+debugging them today means copying fragments by hand. No mainstream client does
+this well. Hidden Power on top of the parser already in the stack. Serves UX
+and Hidden Power.
+
+**Trade-off.** Real complexity: rewriting has dialect edge cases, correlation
+detection is heuristic, and each step costs a query. Kept safe by refusing
+non-reads, the read-only transaction and always-visible SQL; deferred until the
+core loop is solid.
 
 ---
 
