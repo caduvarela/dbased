@@ -3,19 +3,21 @@ use std::sync::Arc;
 
 use async_channel::{Receiver, Sender};
 use dbased_commands::{
-    Command, ConnectionId, ConnectionSettings, ConnectionState, ConnectionSummary, DatabaseKind,
-    ErrorInfo, Event, ExecuteTarget, MetadataItem, MetadataItemKind, MetadataNode, PasswordSource,
+    Command, ConnectionId, ConnectionSettings, ConnectionState, ConnectionSummary, ErrorInfo,
+    Event, ExecuteTarget, MetadataItem, MetadataItemKind, MetadataNode, PasswordSource,
     PasswordUpdate, RequestId, ResultId, TabId,
 };
 use secrecy::SecretString;
 use tokio::sync::oneshot;
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::{Id as TaskId, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::error_info::error_info;
 use super::results::ResultStore;
 use super::store::StoredConnection;
-use super::tab::{PendingExecute, TabHandle, TabMessage, dialect_of, spawn_tab};
+use super::tab::{
+    PendingExecute, RunningSlot, TabHandle, TabMessage, dialect_of, new_tab, plan_statements,
+};
 use super::{ConnectionStore, CoreDependencies, DriverConnector, SecretStore};
 use crate::{CoreError, Driver, TableRef};
 
@@ -27,6 +29,27 @@ struct ConnectionEntry {
     // @NOTE: executes that arrived while the connection was down or connecting; each one holds
     // its tab's running slot, so the tab already reports busy.
     waiting_executes: Vec<PendingExecute>,
+    // @NOTE: explicit `Connect` requests that arrived while an attempt was running; they join it
+    // and end with its result.
+    joined_connects: Vec<RequestId>,
+}
+
+/// What a spawned task serves, so a panic can still end its request (11.1: one terminal event).
+enum TaskRole {
+    Connect {
+        id: ConnectionId,
+        request: Option<RequestId>,
+    },
+    Close {
+        request: Option<RequestId>,
+    },
+    /// A task that emits its own terminal event.
+    Request(RequestId),
+    Tab {
+        tab: TabId,
+        generation: u64,
+        running: RunningSlot,
+    },
 }
 
 /// What a spawned task hands back to the dispatcher. Tasks that only emit their own terminal
@@ -57,6 +80,8 @@ pub(super) struct Dispatcher {
     // @NOTE: set when the config file could not be read, so a save never overwrites it blindly.
     storage_blocked: Option<String>,
     tasks: JoinSet<Completion>,
+    roles: HashMap<TaskId, TaskRole>,
+    next_generation: u64,
     shutting_down: bool,
 }
 
@@ -72,6 +97,8 @@ impl Dispatcher {
             results: ResultStore::default(),
             storage_blocked: None,
             tasks: JoinSet::new(),
+            roles: HashMap::new(),
+            next_generation: 0,
             shutting_down: false,
         }
     }
@@ -84,7 +111,7 @@ impl Dispatcher {
                     Ok(command) => self.handle(command).await,
                     Err(_) => break,
                 },
-                Some(joined) = self.tasks.join_next() => self.complete(joined).await,
+                Some(joined) = self.tasks.join_next_with_id() => self.complete(joined).await,
             }
         }
         self.shut_down().await;
@@ -104,6 +131,7 @@ impl Dispatcher {
                             state: ConnectionState::Disconnected,
                             driver: None,
                             waiting_executes: Vec::new(),
+                            joined_connects: Vec::new(),
                         },
                     );
                 }
@@ -153,11 +181,7 @@ impl Dispatcher {
                 script,
                 target,
             } => self.execute(request, tab, script, target).await,
-            Command::Cancel { tab, request } => {
-                if let Some(handle) = self.tabs.get(&tab) {
-                    handle.running.cancel(request);
-                }
-            }
+            Command::Cancel { tab, request } => self.cancel(tab, request).await,
             Command::FetchRows {
                 result,
                 start,
@@ -165,6 +189,15 @@ impl Dispatcher {
             } => self.fetch_rows(result, start, count).await,
             Command::ReleaseResult { result } => self.results.release(result),
         }
+    }
+
+    fn spawn_task(
+        &mut self,
+        role: TaskRole,
+        task: impl Future<Output = Completion> + Send + 'static,
+    ) {
+        let handle = self.tasks.spawn(task);
+        self.roles.insert(handle.id(), role);
     }
 
     async fn emit(&self, event: Event) {
@@ -292,6 +325,7 @@ impl Dispatcher {
                         state: ConnectionState::Disconnected,
                         driver: None,
                         waiting_executes: Vec::new(),
+                        joined_connects: Vec::new(),
                     },
                 );
             }
@@ -341,13 +375,16 @@ impl Dispatcher {
             return;
         }
         let removed = self.connections.remove(&id);
-        let (driver, waiting) = match removed {
-            Some(entry) => (entry.driver, entry.waiting_executes),
-            None => (None, Vec::new()),
+        let (driver, waiting, joined) = match removed {
+            Some(entry) => (entry.driver, entry.waiting_executes, entry.joined_connects),
+            None => (None, Vec::new(), Vec::new()),
         };
         for pending in waiting {
             self.fail(pending.request, &CoreError::UnknownConnection)
                 .await;
+        }
+        for request in joined {
+            self.fail(request, &CoreError::UnknownConnection).await;
         }
         let closing_tabs = self.close_tabs_of(id);
         let secret_result = self.delete_secret(id).await;
@@ -371,13 +408,14 @@ impl Dispatcher {
         request: Option<RequestId>,
         tabs_released: Vec<oneshot::Receiver<()>>,
     ) {
-        self.tasks.spawn(async move {
+        let task = async move {
             futures_util::future::join_all(tabs_released).await;
             if let Some(driver) = driver {
                 driver.close().await;
             }
             Completion::Closed { request }
-        });
+        };
+        self.spawn_task(TaskRole::Close { request }, task);
     }
 
     /// Cancels what is running and asks every tab of the connection to close its session.
@@ -418,17 +456,12 @@ impl Dispatcher {
             .collect()
     }
 
-    /// Cancels, asks the actor to close (it emits `TabClosed`) and keeps its task joined by the
-    /// dispatcher, so shutdown waits for it.
-    fn close_handle(&mut self, handle: TabHandle) -> oneshot::Receiver<()> {
+    /// Cancels and asks the actor to close (it emits `TabClosed`). The actor's task lives in
+    /// `tasks`, so shutdown waits for it.
+    fn close_handle(&self, handle: TabHandle) -> oneshot::Receiver<()> {
         handle.running.cancel_current();
         let (done, acknowledged) = oneshot::channel();
         handle.messages.send(TabMessage::Close { done }).ok();
-        let task = handle.task;
-        self.tasks.spawn(async move {
-            task.await.ok();
-            Completion::Done
-        });
         acknowledged
     }
 
@@ -442,7 +475,24 @@ impl Dispatcher {
                 .await;
             return;
         }
-        let handle = spawn_tab(tab, connection, self.events.clone(), self.results.clone());
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        let (handle, actor) = new_tab(
+            tab,
+            generation,
+            connection,
+            self.events.clone(),
+            self.results.clone(),
+        );
+        let role = TaskRole::Tab {
+            tab,
+            generation,
+            running: handle.running.clone(),
+        };
+        self.spawn_task(role, async move {
+            actor.await;
+            Completion::Done
+        });
         self.tabs.insert(tab, handle);
     }
 
@@ -473,6 +523,24 @@ impl Dispatcher {
             self.fail(request, &CoreError::UnknownTab).await;
             return;
         };
+        let connection = handle.connection;
+        let Some(kind) = self
+            .connections
+            .get(&connection)
+            .map(|entry| entry.settings.kind)
+        else {
+            self.fail(request, &CoreError::UnknownConnection).await;
+            return;
+        };
+        // @NOTE: planned before the slot is claimed or any connect starts, so an empty script
+        // or a bad selection costs nothing.
+        let plan = match plan_statements(&script, target, dialect_of(kind)) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.fail(request, &error).await;
+                return;
+            }
+        };
         let token = CancellationToken::new();
         if let Err(error) = handle.running.begin(request, token.clone()) {
             self.fail(request, &error).await;
@@ -483,20 +551,18 @@ impl Dispatcher {
             request,
             tab,
             script,
-            target,
+            plan,
             token,
         };
-        let Some(entry) = self.connections.get_mut(&handle.connection) else {
+        let Some(entry) = self.connections.get_mut(&connection) else {
             running.finish();
             self.fail(request, &CoreError::UnknownConnection).await;
             return;
         };
-        let connection = handle.connection;
         let connected = match (&entry.driver, entry.state) {
             (Some(driver), ConnectionState::Connected) => Some(driver.clone()),
             _ => None,
         };
-        let kind = entry.settings.kind;
         let Some(driver) = connected else {
             let must_connect = entry.state == ConnectionState::Disconnected;
             entry.waiting_executes.push(pending);
@@ -507,10 +573,30 @@ impl Dispatcher {
             }
             return;
         };
-        self.forward(pending, driver, kind).await;
+        self.forward(pending, driver).await;
     }
 
-    async fn forward(&self, pending: PendingExecute, driver: Arc<dyn Driver>, kind: DatabaseKind) {
+    /// A request still waiting for its connection never reached the tab actor, so the
+    /// dispatcher ends it. Cancelling before the start ends like cancelling at statement 0.
+    async fn cancel(&mut self, tab: TabId, request: RequestId) {
+        let Some(handle) = self.tabs.get(&tab) else {
+            return;
+        };
+        let waiting = self
+            .connections
+            .get_mut(&handle.connection)
+            .and_then(|entry| take_waiting_request(entry, tab, request));
+        let Some(pending) = waiting else {
+            handle.running.cancel(request);
+            return;
+        };
+        handle.running.finish();
+        for event in pending.cancelled_events() {
+            self.emit(event).await;
+        }
+    }
+
+    async fn forward(&self, pending: PendingExecute, driver: Arc<dyn Driver>) {
         let request = pending.request;
         let Some(handle) = self.tabs.get(&pending.tab) else {
             self.fail(request, &CoreError::UnknownTab).await;
@@ -519,7 +605,6 @@ impl Dispatcher {
         let message = TabMessage::Execute {
             job: pending,
             driver,
-            dialect: dialect_of(kind),
         };
         if handle.messages.send(message).is_err() {
             handle.running.finish();
@@ -563,7 +648,7 @@ impl Dispatcher {
         let secrets = self.secrets.clone();
         let connector = self.connector.clone();
         let events = self.events.clone();
-        self.tasks.spawn(async move {
+        let task = async move {
             let outcome = async {
                 let password = resolve_password(secrets, id, password).await?;
                 let driver = connector.connect(&settings, password).await?;
@@ -573,7 +658,8 @@ impl Dispatcher {
             .await;
             events.send(terminal_event(request, outcome)).await.ok();
             Completion::Done
-        });
+        };
+        self.spawn_task(TaskRole::Request(request), task);
     }
 
     async fn connect(&mut self, request: RequestId, id: ConnectionId, password: PasswordSource) {
@@ -587,8 +673,7 @@ impl Dispatcher {
                 return;
             }
             ConnectionState::Connecting => {
-                let error = CoreError::Internal("a connection attempt is already running".into());
-                self.fail(request, &error).await;
+                entry.joined_connects.push(request);
                 return;
             }
             ConnectionState::Disconnected => {}
@@ -615,7 +700,7 @@ impl Dispatcher {
 
         let secrets = self.secrets.clone();
         let connector = self.connector.clone();
-        self.tasks.spawn(async move {
+        let task = async move {
             let result = async {
                 let password = resolve_password(secrets, Some(id), password).await?;
                 connector.connect(&settings, password).await
@@ -626,7 +711,8 @@ impl Dispatcher {
                 id,
                 result,
             }
-        });
+        };
+        self.spawn_task(TaskRole::Connect { id, request }, task);
     }
 
     async fn disconnect(&mut self, request: RequestId, id: ConnectionId) {
@@ -669,7 +755,7 @@ impl Dispatcher {
             return;
         };
         let events = self.events.clone();
-        self.tasks.spawn(async move {
+        let task = async move {
             let event = match children_of(driver.as_ref(), &node).await {
                 Ok(items) => Event::ChildrenLoaded {
                     request,
@@ -685,25 +771,90 @@ impl Dispatcher {
             // @NOTE: sent even after a disconnect; the UI drops it by request id (3.2.4).
             events.send(event).await.ok();
             Completion::Done
-        });
+        };
+        self.spawn_task(TaskRole::Request(request), task);
     }
 
-    async fn complete(&mut self, joined: Result<Completion, JoinError>) {
-        // @NOTE: a panicked task cannot say which request it served; it is dropped here.
-        let Ok(completion) = joined else { return };
+    async fn complete(&mut self, joined: Result<(TaskId, Completion), JoinError>) {
+        let completion = match joined {
+            Ok((task, completion)) => {
+                self.roles.remove(&task);
+                completion
+            }
+            Err(error) => {
+                let role = self.roles.remove(&error.id());
+                self.task_failed(role).await;
+                return;
+            }
+        };
         match completion {
             Completion::Done => {}
-            Completion::Closed { request } => {
-                if let Some(request) = request {
-                    self.emit(Event::RequestCompleted { request }).await;
-                }
-            }
+            Completion::Closed { request } => self.complete_closed(request).await,
             Completion::Connected {
                 request,
                 id,
                 result,
             } => self.finish_connect(request, id, result).await,
         }
+    }
+
+    async fn complete_closed(&self, request: Option<RequestId>) {
+        if let Some(request) = request {
+            self.emit(Event::RequestCompleted { request }).await;
+        }
+    }
+
+    /// A panicked task still owes its request a terminal event and its state a clean-up.
+    async fn task_failed(&mut self, role: Option<TaskRole>) {
+        let error = CoreError::Internal("a background task panicked".into());
+        match role {
+            None => {}
+            Some(TaskRole::Connect { id, request }) => {
+                self.finish_connect(request, id, Err(error)).await;
+            }
+            // @NOTE: the pool may be left open; completing the request keeps the UI unstuck.
+            Some(TaskRole::Close { request }) => self.complete_closed(request).await,
+            Some(TaskRole::Request(request)) => self.fail(request, &error).await,
+            Some(TaskRole::Tab {
+                tab,
+                generation,
+                running,
+            }) => self.tab_died(tab, generation, &running, &error).await,
+        }
+    }
+
+    async fn tab_died(
+        &mut self,
+        tab: TabId,
+        generation: u64,
+        running: &RunningSlot,
+        error: &CoreError,
+    ) {
+        let still_listed = self
+            .tabs
+            .get(&tab)
+            .is_some_and(|handle| handle.generation == generation);
+        let removed = if still_listed {
+            self.tabs.remove(&tab)
+        } else {
+            None
+        };
+        let waiting = removed
+            .and_then(|handle| self.connections.get_mut(&handle.connection))
+            .map(|entry| take_waiting_of(entry, tab))
+            .unwrap_or_default();
+        let mut failed: Vec<RequestId> = Vec::new();
+        for pending in waiting {
+            failed.push(pending.request);
+            self.fail(pending.request, error).await;
+        }
+        if let Some(request) = running.take()
+            && !failed.contains(&request)
+        {
+            self.fail(request, error).await;
+        }
+        self.results.release_tab(tab, generation);
+        self.emit(Event::TabClosed { tab }).await;
     }
 
     async fn finish_connect(
@@ -718,19 +869,26 @@ impl Dispatcher {
             if let Ok(driver) = result {
                 driver.close().await;
             }
+            // @NOTE: joined connects were already failed by the delete.
             if let Some(request) = request {
                 self.fail(request, &CoreError::UnknownConnection).await;
             }
             return;
         };
         let waiting = std::mem::take(&mut entry.waiting_executes);
-        let kind = entry.settings.kind;
+        let requests: Vec<RequestId> = request
+            .into_iter()
+            .chain(std::mem::take(&mut entry.joined_connects))
+            .collect();
         match result {
             Ok(driver) if self.shutting_down => {
                 entry.state = ConnectionState::Disconnected;
                 driver.close().await;
-                let error = error_info(&CoreError::Connection("the core is shutting down".into()));
-                self.fail_waiting(waiting, &error).await;
+                let error = CoreError::Connection("the core is shutting down".into());
+                for request in requests {
+                    self.fail(request, &error).await;
+                }
+                self.fail_waiting(waiting, &error_info(&error)).await;
             }
             Ok(driver) => {
                 entry.driver = Some(driver.clone());
@@ -740,11 +898,11 @@ impl Dispatcher {
                     state: ConnectionState::Connected,
                 })
                 .await;
-                if let Some(request) = request {
+                for request in requests {
                     self.emit(Event::RequestCompleted { request }).await;
                 }
                 for pending in waiting {
-                    self.forward(pending, driver.clone(), kind).await;
+                    self.forward(pending, driver.clone()).await;
                 }
             }
             Err(error) => {
@@ -754,7 +912,7 @@ impl Dispatcher {
                     state: ConnectionState::Disconnected,
                 })
                 .await;
-                if let Some(request) = request {
+                for request in requests {
                     self.fail(request, &error).await;
                 }
                 self.fail_waiting(waiting, &error_info(&error)).await;
@@ -769,7 +927,7 @@ impl Dispatcher {
         for handle in handles {
             self.close_handle(handle);
         }
-        while let Some(joined) = self.tasks.join_next().await {
+        while let Some(joined) = self.tasks.join_next_with_id().await {
             self.complete(joined).await;
         }
         let drivers: Vec<Arc<dyn Driver>> = self
@@ -788,6 +946,18 @@ fn take_waiting_of(entry: &mut ConnectionEntry, tab: TabId) -> Vec<PendingExecut
         .partition(|pending| pending.tab == tab);
     entry.waiting_executes = others;
     mine
+}
+
+fn take_waiting_request(
+    entry: &mut ConnectionEntry,
+    tab: TabId,
+    request: RequestId,
+) -> Option<PendingExecute> {
+    let position = entry
+        .waiting_executes
+        .iter()
+        .position(|pending| pending.tab == tab && pending.request == request)?;
+    Some(entry.waiting_executes.remove(position))
 }
 
 fn validate_settings(settings: &ConnectionSettings) -> Result<(), CoreError> {

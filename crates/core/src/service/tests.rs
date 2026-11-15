@@ -30,6 +30,7 @@ use super::tests_session::{ScriptedSession, SessionLog};
 pub(super) const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct ScriptedDriver {
+    panic_on_close: bool,
     closes: Arc<AtomicUsize>,
     sessions: Arc<SessionLog>,
 }
@@ -91,6 +92,7 @@ impl Driver for ScriptedDriver {
     }
 
     async fn close(&self) {
+        assert!(!self.panic_on_close, "scripted panic on driver close");
         self.sessions.order.lock().unwrap().push("driver_close");
         self.closes.fetch_add(1, Ordering::SeqCst);
     }
@@ -110,6 +112,9 @@ pub(super) struct ScriptedConnector {
     pub(super) closes: Arc<AtomicUsize>,
     pub(super) sessions: Arc<SessionLog>,
     pub(super) required_password: Option<&'static str>,
+    pub(super) connect_delay: Duration,
+    pub(super) panic_on_connect: bool,
+    pub(super) panic_on_close: bool,
 }
 
 #[async_trait]
@@ -120,12 +125,15 @@ impl DriverConnector for ScriptedConnector {
         password: SecretString,
     ) -> Result<Arc<dyn Driver>, CoreError> {
         self.connects.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.connect_delay).await;
+        assert!(!self.panic_on_connect, "scripted panic on connect");
         if let Some(required) = self.required_password
             && password.expose_secret() != required
         {
             return Err(CoreError::Authentication("wrong password".into()));
         }
         Ok(Arc::new(ScriptedDriver {
+            panic_on_close: self.panic_on_close,
             closes: self.closes.clone(),
             sessions: self.sessions.clone(),
         }))
@@ -944,4 +952,156 @@ fn every_core_error_maps_to_its_error_kind() {
     assert_eq!(database.sqlstate, "42P01");
     assert_eq!(database.position, Some(8));
     assert_eq!(database.hint.as_deref(), Some("hint"));
+}
+
+#[tokio::test]
+async fn a_connect_finishing_during_shutdown_still_ends_its_request() {
+    let connector = ScriptedConnector {
+        connect_delay: Duration::from_millis(200),
+        ..ScriptedConnector::default()
+    };
+    let harness = Harness::with_connector(connector).await;
+    let id = harness.save(1, None, "db").await;
+    harness
+        .send(Command::Connect {
+            request: RequestId(2),
+            id,
+            password: PasswordSource::None,
+        })
+        .await;
+    let remaining = harness.shut_down().await;
+    let terminals: Vec<_> = remaining
+        .iter()
+        .filter(|event| terminal_request(event) == Some(RequestId(2)))
+        .collect();
+    assert_eq!(terminals.len(), 1, "{remaining:?}");
+    assert_eq!(failed_kind(terminals[0]), ErrorKind::Connection);
+}
+
+/// Reads events until every request in `requests` has its terminal event.
+async fn terminals_of(harness: &Harness, requests: &[u64]) -> HashMap<RequestId, Event> {
+    let mut found = HashMap::new();
+    while found.len() < requests.len() {
+        let event = harness.next_event().await;
+        if let Some(request) = terminal_request(&event)
+            && requests.contains(&request.0)
+        {
+            assert!(found.insert(request, event).is_none(), "two terminals");
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn a_second_connect_joins_the_running_attempt_and_shares_its_result() {
+    let connector = ScriptedConnector {
+        connect_delay: Duration::from_millis(200),
+        ..ScriptedConnector::default()
+    };
+    let harness = Harness::with_connector(connector).await;
+    let id = harness.save(1, None, "db").await;
+    for request in [2, 3] {
+        harness
+            .send(Command::Connect {
+                request: RequestId(request),
+                id,
+                password: PasswordSource::None,
+            })
+            .await;
+    }
+    let terminals = terminals_of(&harness, &[2, 3]).await;
+    assert!(
+        terminals
+            .values()
+            .all(|event| matches!(event, Event::RequestCompleted { .. }))
+    );
+    assert_eq!(harness.connector.connects.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_second_connect_joining_a_failing_attempt_gets_the_same_error() {
+    let connector = ScriptedConnector {
+        connect_delay: Duration::from_millis(200),
+        required_password: Some("another"),
+        ..ScriptedConnector::default()
+    };
+    let harness = Harness::with_connector(connector).await;
+    let id = harness.save(1, None, "db").await;
+    for request in [2, 3] {
+        harness
+            .send(Command::Connect {
+                request: RequestId(request),
+                id,
+                password: PasswordSource::None,
+            })
+            .await;
+    }
+    let terminals = terminals_of(&harness, &[2, 3]).await;
+    for event in terminals.values() {
+        assert_eq!(failed_kind(event), ErrorKind::Authentication);
+    }
+}
+
+#[tokio::test]
+async fn a_connect_task_that_panics_fails_the_connect_like_a_connect_error() {
+    let connector = ScriptedConnector {
+        panic_on_connect: true,
+        ..ScriptedConnector::default()
+    };
+    let harness = Harness::with_connector(connector).await;
+    let id = harness.save(1, None, "db").await;
+    let events = harness
+        .request(
+            Command::Connect {
+                request: RequestId(2),
+                id,
+                password: PasswordSource::None,
+            },
+            RequestId(2),
+        )
+        .await;
+    assert_eq!(failed_kind(events.last().unwrap()), ErrorKind::Internal);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ConnectionStateChanged {
+            state: ConnectionState::Disconnected,
+            ..
+        }
+    )));
+    // The state is resolved, so another attempt is accepted (and fails the same way).
+    let events = harness
+        .request(
+            Command::Connect {
+                request: RequestId(3),
+                id,
+                password: PasswordSource::None,
+            },
+            RequestId(3),
+        )
+        .await;
+    assert_eq!(failed_kind(events.last().unwrap()), ErrorKind::Internal);
+}
+
+#[tokio::test]
+async fn a_close_task_that_panics_still_completes_the_disconnect() {
+    let connector = ScriptedConnector {
+        panic_on_close: true,
+        ..ScriptedConnector::default()
+    };
+    let harness = Harness::with_connector(connector).await;
+    let id = harness.save(1, None, "db").await;
+    harness.connect(2, id, PasswordSource::None).await;
+    let events = harness
+        .request(
+            Command::Disconnect {
+                request: RequestId(3),
+                id,
+            },
+            RequestId(3),
+        )
+        .await;
+    assert!(matches!(
+        events.last(),
+        Some(Event::RequestCompleted { .. })
+    ));
 }
