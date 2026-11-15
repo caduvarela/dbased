@@ -396,6 +396,156 @@ async fn a_dropped_execute_future_poisons_the_session() {
 }
 
 #[tokio::test]
+async fn a_token_cancelled_before_execute_never_sends_the_statement() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+
+    let token = CancellationToken::new();
+    token.cancel();
+    let started = std::time::Instant::now();
+    let result = run_with(&mut session, "SELECT pg_sleep(30)", token).await;
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(result.outcome.status, StatementStatus::Cancelled);
+    assert_eq!(result.outcome.rows_received, 0);
+    assert!(result.columns.is_empty());
+    assert_eq!(result.outcome.session, SessionHealth::Healthy);
+    let next = run(&mut session, "SELECT 1").await;
+    assert_eq!(next.rows, vec![vec![Value::Int(1)]]);
+}
+
+#[tokio::test]
+async fn a_full_channel_with_a_cancel_does_not_block_execute() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+
+    // Nobody reads, so the channel fills up and the driver waits on the sink.
+    let (sink, receiver) = RowSink::channel(1);
+    let token = CancellationToken::new();
+    cancel_after(&token, Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let outcome = session
+        .execute(
+            UserSql::new("SELECT g FROM generate_series(1, 5000000) g"),
+            sink,
+            token,
+        )
+        .await
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert_eq!(outcome.status, StatementStatus::Cancelled);
+    assert!(outcome.rows_received <= 1, "{outcome:?}");
+    assert_eq!(outcome.session, SessionHealth::Healthy);
+    drop(receiver);
+    let next = run(&mut session, "SELECT 1").await;
+    assert_eq!(next.outcome.status, StatementStatus::Completed);
+}
+
+#[tokio::test]
+async fn a_dropped_receiver_cancels_with_consumer_gone_semantics() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+
+    let (sink, receiver) = RowSink::channel(1);
+    drop(receiver);
+    let outcome = session
+        .execute(
+            UserSql::new("SELECT g FROM generate_series(1, 5000000) g"),
+            sink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, StatementStatus::Cancelled);
+    assert!(outcome.partial);
+    assert_eq!(outcome.rows_received, 0);
+    assert_eq!(outcome.session, SessionHealth::Healthy);
+    let next = run(&mut session, "SELECT 1").await;
+    assert_eq!(next.outcome.status, StatementStatus::Completed);
+}
+
+#[tokio::test]
+async fn cancel_works_when_the_pool_is_busy_and_falls_back_to_a_one_off_connection() {
+    let database = TestDatabase::create().await;
+    let mut config = database.config();
+    config.pool_max_connections = 1;
+    config.cancel_acquire_timeout = Duration::from_millis(1);
+    let driver = PostgresDriver::connect(config).await.expect("connects");
+    let mut session = driver.open_session().await.unwrap();
+
+    // Keep the single pool connection busy so acquiring it for the cancel times out.
+    let driver: std::sync::Arc<dyn Driver> = driver.into();
+    let busy: Vec<_> = (0..8)
+        .map(|_| {
+            let driver = driver.clone();
+            tokio::spawn(async move {
+                loop {
+                    driver.list_schemas().await.ok();
+                }
+            })
+        })
+        .collect();
+
+    let token = CancellationToken::new();
+    cancel_after(&token, Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let result = run_with(&mut session, "SELECT pg_sleep(30)", token).await;
+    for task in busy {
+        task.abort();
+    }
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(result.outcome.status, StatementStatus::Cancelled);
+    assert!(
+        result.outcome.cancel_error.is_none(),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(result.outcome.session, SessionHealth::Healthy);
+}
+
+#[tokio::test]
+async fn a_server_side_termination_closes_the_session() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+    let id = session.session_id();
+
+    let mut admin = database.admin().await;
+    let terminate = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sqlx::query("SELECT pg_terminate_backend($1)")
+            .bind(i32::try_from(id.0).unwrap())
+            .execute(&mut admin)
+            .await
+            .unwrap();
+    };
+    let (sink, _receiver) = RowSink::channel(8);
+    let (result, ()) = tokio::join!(
+        session.execute(
+            UserSql::new("SELECT pg_sleep(30)"),
+            sink,
+            CancellationToken::new()
+        ),
+        terminate
+    );
+
+    // The server reports 57P01 (outcome) or the socket just dies (error): both end the session.
+    if let Ok(outcome) = result {
+        assert_eq!(
+            outcome.session,
+            SessionHealth::Closed(CloseReason::ConnectionError)
+        );
+    }
+    let (sink, _receiver) = RowSink::channel(1);
+    let next = session
+        .execute(UserSql::new("SELECT 1"), sink, CancellationToken::new())
+        .await;
+    assert!(matches!(next, Err(CoreError::SessionClosed(_))));
+}
+
+#[tokio::test]
 async fn closing_a_session_ends_the_backend() {
     let database = TestDatabase::create().await;
     let (_driver, session) = open(&database).await;
