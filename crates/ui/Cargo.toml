@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 dbased-commands.workspace = true
 async-channel.workspace = true
+secrecy.workspace = true
 gpui.workspace = true
 # @NOTE: tree-sitter-sql gives the editor SQL highlighting.
 gpui-component = { workspace = true, features = ["tree-sitter-sql"] }

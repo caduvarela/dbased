@@ -323,3 +323,300 @@ fn an_unprompted_core_error_becomes_a_notice() {
     });
     assert_eq!(state.notice.as_deref(), Some("config unreadable"));
 }
+
+// Connection management.
+
+mod connections {
+    use dbased_commands::{ErrorInfo, ErrorKind, Event, PasswordUpdate, RequestId};
+    use secrecy::SecretString;
+
+    use super::*;
+    use crate::state::{ConnectionForm, SaveStatus, TestStatus};
+
+    fn valid_form() -> ConnectionForm {
+        let mut form = ConnectionForm::new();
+        form.name = "Reports".to_string();
+        form.user = "reader".to_string();
+        form
+    }
+
+    fn password_required() -> ErrorInfo {
+        ErrorInfo {
+            kind: ErrorKind::PasswordRequired,
+            message: "a password is required".to_string(),
+            database: None,
+        }
+    }
+
+    #[test]
+    fn an_invalid_form_sends_nothing() {
+        let mut harness = Harness::new();
+        let mut form = valid_form();
+        form.host.clear();
+        assert!(harness.state.test_connection(&form).is_err());
+        assert!(harness.state.save_connection(&form).is_err());
+        assert_eq!(harness.state.flow.test, TestStatus::Idle);
+        assert_eq!(harness.state.flow.save, SaveStatus::Idle);
+    }
+
+    #[test]
+    fn testing_a_connection_ends_in_success() {
+        let mut harness = Harness::new();
+        let commands = harness.state.test_connection(&valid_form()).unwrap();
+        assert_eq!(harness.state.flow.test, TestStatus::Testing);
+        harness.run(commands);
+        assert_eq!(harness.state.flow.test, TestStatus::Success);
+    }
+
+    #[test]
+    fn a_second_test_is_ignored_while_one_runs() {
+        let mut harness = Harness::new();
+        harness.state.test_connection(&valid_form()).unwrap();
+        let again = harness.state.test_connection(&valid_form()).unwrap();
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn a_failed_test_shows_the_cores_message() {
+        let mut harness = Harness::new();
+        let request = RequestId(900);
+        harness
+            .state
+            .flow
+            .track(request, crate::state::connection_flow::Pending::Test);
+        harness.state.flow.test = TestStatus::Testing;
+        harness.state.apply(Event::RequestFailed {
+            request,
+            error: ErrorInfo {
+                kind: ErrorKind::Connection,
+                message: "connection refused".to_string(),
+                database: None,
+            },
+        });
+        assert_eq!(
+            harness.state.flow.test,
+            TestStatus::Failed("connection refused".to_string())
+        );
+    }
+
+    #[test]
+    fn saving_a_new_connection_adds_it_with_its_password() {
+        let mut harness = Harness::new();
+        let mut form = valid_form();
+        form.password = SecretString::from("pw".to_string());
+        let commands = harness.state.save_connection(&form).unwrap();
+        assert!(matches!(
+            &commands[0],
+            Command::SaveConnection {
+                id: None,
+                password: PasswordUpdate::Save(_),
+                ..
+            }
+        ));
+        harness.run(commands);
+        assert_eq!(harness.state.flow.save, SaveStatus::Saved(ConnectionId(3)));
+        let saved = harness.state.connections.get(ConnectionId(3)).unwrap();
+        assert_eq!(saved.settings.name, "Reports");
+        assert!(saved.password_saved);
+    }
+
+    #[test]
+    fn unchecking_save_password_forgets_it() {
+        let mut harness = Harness::new();
+        let mut form = valid_form();
+        form.save_password = false;
+        let commands = harness.state.save_connection(&form).unwrap();
+        harness.run(commands);
+        let saved = harness.state.connections.get(ConnectionId(3)).unwrap();
+        assert!(!saved.password_saved);
+    }
+
+    #[test]
+    fn editing_updates_the_same_connection() {
+        let mut harness = Harness::new();
+        let summary = harness
+            .state
+            .connections
+            .get(ConnectionId(2))
+            .unwrap()
+            .clone();
+        let mut form = ConnectionForm::from_summary(&summary);
+        form.name = "Renamed".to_string();
+        let commands = harness.state.save_connection(&form).unwrap();
+        harness.run(commands);
+        assert_eq!(harness.state.connections.name(ConnectionId(2)), "Renamed");
+        assert_eq!(harness.state.connections.items().len(), 2);
+    }
+
+    #[test]
+    fn connect_and_disconnect_follow_the_core() {
+        let mut harness = Harness::new();
+        let commands = harness.state.connect(ConnectionId(1));
+        harness.run(commands);
+        let state_of = |harness: &Harness| {
+            harness
+                .state
+                .connections
+                .get(ConnectionId(1))
+                .unwrap()
+                .state
+        };
+        assert_eq!(
+            state_of(&harness),
+            dbased_commands::ConnectionState::Connected
+        );
+        let commands = harness.state.disconnect(ConnectionId(1));
+        harness.run(commands);
+        assert_eq!(
+            state_of(&harness),
+            dbased_commands::ConnectionState::Disconnected
+        );
+    }
+
+    fn forget_password(harness: &mut Harness, id: ConnectionId) {
+        let summary = harness.state.connections.get(id).unwrap().clone();
+        let mut form = ConnectionForm::from_summary(&summary);
+        form.save_password = false;
+        let commands = harness.state.save_connection(&form).unwrap();
+        harness.run(commands);
+    }
+
+    #[test]
+    fn connecting_without_a_saved_password_opens_the_prompt() {
+        let mut harness = Harness::new();
+        forget_password(&mut harness, ConnectionId(2));
+        let commands = harness.state.connect(ConnectionId(2));
+        harness.run(commands);
+        let prompt = harness.state.flow.password_prompt.clone().unwrap();
+        assert_eq!(prompt.connection, ConnectionId(2));
+        assert!(prompt.resume.is_none());
+
+        let commands = harness
+            .state
+            .submit_password(SecretString::from("typed".to_string()), false);
+        assert!(matches!(
+            &commands[0],
+            Command::Connect {
+                password: dbased_commands::PasswordSource::Typed(_),
+                ..
+            }
+        ));
+        assert_eq!(commands.len(), 1);
+        harness.run(commands);
+        assert!(harness.state.flow.password_prompt.is_none());
+        let connected = harness
+            .state
+            .connections
+            .get(ConnectionId(2))
+            .unwrap()
+            .state;
+        assert_eq!(connected, dbased_commands::ConnectionState::Connected);
+    }
+
+    #[test]
+    fn the_prompt_can_also_save_the_password() {
+        let mut harness = Harness::new();
+        forget_password(&mut harness, ConnectionId(2));
+        let commands = harness.state.connect(ConnectionId(2));
+        harness.run(commands);
+        let commands = harness
+            .state
+            .submit_password(SecretString::from("typed".to_string()), true);
+        assert!(matches!(
+            &commands[1],
+            Command::SaveConnection {
+                id: Some(ConnectionId(2)),
+                password: PasswordUpdate::Save(_),
+                ..
+            }
+        ));
+        harness.run(commands);
+        assert!(
+            harness
+                .state
+                .connections
+                .get(ConnectionId(2))
+                .unwrap()
+                .password_saved
+        );
+    }
+
+    #[test]
+    fn cancelling_the_prompt_drops_it() {
+        let mut harness = Harness::new();
+        forget_password(&mut harness, ConnectionId(2));
+        let commands = harness.state.connect(ConnectionId(2));
+        harness.run(commands);
+        harness.state.cancel_password();
+        assert!(harness.state.flow.password_prompt.is_none());
+    }
+
+    #[test]
+    fn an_execute_needing_a_password_prompts_then_replays() {
+        let mut harness = Harness::new();
+        let tab = harness.first_tab();
+        let commands = harness
+            .state
+            .execute(tab, "select 3".to_string(), ExecuteTarget::All);
+        let Command::Execute { request, .. } = commands.last().unwrap().clone() else {
+            panic!("an execute");
+        };
+        // The fake never refuses an execute, so play the refusal by hand.
+        let replies = harness.state.apply(Event::RequestFailed {
+            request,
+            error: password_required(),
+        });
+        assert!(replies.is_empty());
+        assert_eq!(harness.state.tab_status(tab), Some(TabStatus::NotConnected));
+        assert!(harness.state.can_run(tab));
+        let prompt = harness.state.flow.password_prompt.clone().unwrap();
+        assert_eq!(prompt.connection, ConnectionId(1));
+
+        let commands = harness
+            .state
+            .submit_password(SecretString::from("pw".to_string()), false);
+        harness.run(commands);
+        let tab_model = harness.state.tabs.get(tab).unwrap();
+        assert_eq!(
+            tab_model.results.len(),
+            1,
+            "the script ran after connecting"
+        );
+    }
+
+    #[test]
+    fn the_delete_confirmation_counts_open_tabs() {
+        let mut harness = Harness::new();
+        let (_, commands) = harness.state.open_tab(ConnectionId(1)).unwrap();
+        harness.run(commands);
+        let confirmation = harness.state.delete_confirmation(ConnectionId(1)).unwrap();
+        assert_eq!(confirmation.open_tabs, 2);
+        assert!(confirmation.message().contains("2 open tabs"));
+        let other = harness.state.delete_confirmation(ConnectionId(2)).unwrap();
+        assert_eq!(other.open_tabs, 0);
+        assert!(!other.message().contains("tab"));
+    }
+
+    #[test]
+    fn deleting_a_connection_closes_its_tabs_first() {
+        let mut harness = Harness::new();
+        let (_, commands) = harness.state.open_tab(ConnectionId(2)).unwrap();
+        harness.run(commands);
+        let commands = harness.state.delete_connection(ConnectionId(1));
+        assert!(matches!(commands[0], Command::CloseTab { .. }));
+        assert!(matches!(
+            commands.last().unwrap(),
+            Command::DeleteConnection { .. }
+        ));
+        harness.run(commands);
+        assert!(harness.state.connections.get(ConnectionId(1)).is_none());
+        assert!(
+            harness
+                .state
+                .tabs
+                .iter()
+                .all(|tab| tab.connection == ConnectionId(2))
+        );
+        assert_eq!(harness.state.tabs.len(), 1);
+    }
+}
