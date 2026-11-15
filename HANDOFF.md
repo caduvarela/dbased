@@ -6,15 +6,18 @@
 - `core`: `CoreError` and `Driver` trait skeleton (no implementations yet).
 - `ui`: empty gpui-component window via `run()`; `app` starts tokio on a background thread and calls it.
 - fmt, clippy (-D warnings) and build pass. Dependency rule verified with `cargo tree`.
+- `docs/PROJECT.md`: Constitution + Architecture Decisions, re-verified against the ecosystem on 2026-11-15 (see its revision log).
 
 ## In progress
 - Nothing.
 
 ## Next step
-- Implement the SQLite driver (simplest) behind `Driver`, then wire Command/Event channels between ui and core.
+- Run the week-one spike (docs/PROJECT.md, Part 10) before building the real UI: 5M-row windowed grid, 100k-line editor with multi-cursor, IME/Wayland, startup time, Dock round-trip, sqlparser tokenizer behavior, keyring stores, driver gotchas (cancel, raw_sql, Value matrix).
+- Then apply the Session/Canceller split to the `Driver` trait (2.1) with the first real driver.
 
 ## Open questions
-- keyring 4.x is declared in `[workspace.dependencies]` but unused. It split into `keyring-core` plus credential-store crates; decide the store setup before first use.
-- `sqlparser`, `directories`, `toml`, `serde`-in-core are declared centrally but not yet used by any crate.
-- `unused_dependencies` cargo lint is allowed workspace-wide until ui/app use their declared deps.
+- Default keymap preset (recommendation: DBeaver-like).
+- Keyring store wiring and the Linux no-Secret-Service fallback (resolved by the spike).
+- Swap `directories` for `etcetera` in the workspace manifest; `sqlparser`, `toml`, `serde`-in-core are declared but unused.
+- `unused_dependencies` lint is allowed workspace-wide until ui/app use their declared deps.
 - The window has not been launched in a display session yet (build only).
