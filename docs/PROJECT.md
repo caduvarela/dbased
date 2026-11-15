@@ -1845,9 +1845,19 @@ Recorded after the first Postgres slice and an independent review:
   transaction is open the driver drains and discards the remaining rows
   instead of cancelling. An explicit user cancel still cancels. Requires
   reliable transaction-state tracking (sqlx hides the ReadyForQuery status).
+  *Implemented:* the session tracks Idle / InTransaction / Unknown. Plain
+  DML/DDL statements keep the state without a round trip; anything else
+  (BEGIN, COMMIT, ROLLBACK, DO, CALL, scripts) gets one probe,
+  `transaction_timestamp() = statement_timestamp()`. Unknown counts as inside
+  a transaction (a false "inside" only costs time). Trade-off: a discard has
+  no drain timeout, so a huge result inside a transaction is read to the end
+  unless the user cancels.
 - **Decided (2026-11), canceller API:** cancellation goes through a handle tied
   to a live session, never a bare `SessionId`, so a cancel can only reach the
   backend while the Core still holds that connection (no PID-reuse hazard).
+  *Implemented:* `Session::cancel_handle()` returns a cloneable `CancelHandle`;
+  cancel after close returns `SessionClosed`, and a lock on a "connection still
+  held" flag orders a cancel against the close.
 
 ### 3.3 Export *(revised 2026-11)*
 
