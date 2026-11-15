@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/commands", "crates/core", "crates/ui", "crates/app"]
+members = ["crates/commands", "crates/core", "crates/sql", "crates/ui", "crates/app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 dbased-commands = { path = "crates/commands" }
 dbased-core = { path = "crates/core" }
+dbased-sql = { path = "crates/sql" }
 dbased-ui = { path = "crates/ui" }
 
 async-trait = "0.1"

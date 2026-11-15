@@ -1441,6 +1441,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbased-sql"
+version = "0.1.0"
+
+[[package]]
 name = "dbased-ui"
 version = "0.1.0"
 dependencies = [
