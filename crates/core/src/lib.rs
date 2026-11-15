@@ -14,6 +14,6 @@ pub use driver::{
 pub use error::{CoreError, DatabaseErrorInfo};
 pub use service::{
     ConnectionStore, Core, CoreDependencies, DefaultConnector, DriverConnector,
-    InMemorySecretStore, SecretStore, StoredConnection, error_info,
+    InMemorySecretStore, KeychainSecretStore, SecretStore, StoredConnection, error_info,
 };
 pub use user_sql::UserSql;

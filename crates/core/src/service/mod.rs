@@ -5,6 +5,7 @@
 mod connector;
 mod dispatcher;
 mod error_info;
+mod keychain;
 mod secrets;
 mod store;
 
@@ -17,6 +18,7 @@ use dbased_commands::CoreLink;
 
 pub use self::connector::{DefaultConnector, DriverConnector};
 pub use self::error_info::error_info;
+pub use self::keychain::KeychainSecretStore;
 pub use self::secrets::{InMemorySecretStore, SecretStore};
 pub use self::store::{ConnectionStore, StoredConnection};
 
