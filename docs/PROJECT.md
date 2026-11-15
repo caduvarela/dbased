@@ -79,6 +79,10 @@ reasoning kept, rather than deleted.
     tests go through the real keymap (7.1).
   - Emoji hotkeys depend on an XIM input method; DBased ships its own
     emoji/symbol picker on `Ctrl+.` (6.1).
+- **2026-11 — Editor UX and Later features.** Sections marked
+  **(revised 2026-11, editor UX)** or **(new 2026-11)**:
+  - The default keymap preset is VS Code-like, with desktop-grab notes and
+    the upstream gap list (9.4, OPEN-6).
 
 ---
 
@@ -2349,24 +2353,71 @@ and Hidden Power.
 **Trade-off.** The tokenizer sits in the execution path; it is small and heavily
 tested.
 
-### 9.4 Keymaps and block navigation (keymap layer: MVP-enabling; presets: Later)
+### 9.4 Keymaps and block navigation (keymap layer: MVP-enabling; presets: Later) *(revised 2026-11, editor UX)*
 
-**Decision.** The editor has a configurable keymap layer with selectable presets: a
-DBased-native default plus DBeaver-like and VS Code-like presets. Presets are
-necessary because the same shortcut collides across tools: VS Code Alt+Up/Down
-*moves lines*, DBeaver Alt+Up/Down *navigates between query blocks*. One default
-cannot serve both, so it is a preset choice, not a single binding. Block navigation
-(jump between statements) reuses the statement boundaries from 9.2.
+**Decision.** The editor has a configurable keymap layer with selectable
+presets. The **default preset is VS Code-like**; DBeaver-like and native (the
+editor's upstream per-OS bindings) stay selectable, and any binding can be
+remapped. Presets are needed because the same shortcut collides across tools:
+VS Code Alt+Up/Down *moves lines*, DBeaver Alt+Up/Down *navigates between query
+blocks*. In the default preset block navigation (which reuses the statement
+boundaries from 9.2) gets a non-colliding binding, chosen with the preset, and
+is always in the command palette. DBased's bindings live in its own
+`bind_keys` in the editor's `"Input"` key context.
 
-**Why.** Lets DBeaver and VS Code users keep their muscle memory. Serves UX. The
-keymap layer is needed anyway for the multi-cursor commands (OPEN-6), so it is
-not extra scope.
+Default preset (Linux and Windows; macOS uses Cmd for Ctrl, as VS Code does):
 
-**Open.** Which preset is the default. Recommendation: DBeaver-like, given the
-target audience and the author's own preference, with VS Code and native
-selectable.
+| Action | Binding | Upstream (gpui-base 0.9.1) |
+|---|---|---|
+| Move line(s) up / down | Alt+Up / Down | build |
+| Copy line(s) up / down | Shift+Alt+Up / Down | build |
+| Add cursor above / below | Ctrl+Alt+Up / Down | exists; rebind on Linux; smart by default (9.4.1) |
+| Add cursor at click | Alt+click, also Ctrl+Alt+click | Alt+click exists; Ctrl+Alt+click to verify |
+| Select next occurrence | Ctrl+D | build on `add_selection` |
+| Select all occurrences | Ctrl+Shift+L | build on `add_selection` |
+| Skip occurrence | Ctrl+K Ctrl+D | build, needs upstream |
+| Undo last cursor | Ctrl+U | build, needs upstream |
+| Toggle line comment | Ctrl+/ | build |
+| Format document or selection | Shift+Alt+F | 9.6 (Later) |
+| Emoji and symbol picker | Ctrl+. | 6.1 |
 
-**Trade-off.** A keymap indirection layer. Required regardless by OPEN-6.
+**This mapping is VS Code's on Windows and macOS, not on Linux.** VS Code on
+Linux uses Shift+Alt+Up/Down for *add cursor* and Ctrl+Shift+Alt+Up/Down for
+*copy line*, and upstream gpui-base binds Shift+Alt+Up/Down to add cursor on
+Linux too. DBased uses the table above on every OS (one muscle memory across
+machines), so on Linux it overrides the upstream Shift+Alt binding and adds
+Ctrl+Alt+Up/Down. Pending the product owner's confirmation (Still open).
+
+**Desktop grabs (measured on MATE / marco).** The window manager takes
+Alt+click and Alt+drag (`mouse-button-modifier` = Alt), so Alt+click never
+reaches the app there; Ctrl+Alt+click is the in-app alternative, and the docs
+name the desktop setting. Ctrl+Alt+Left/Right switch workspaces there, while
+Ctrl+Alt+Up/Down are free; other desktops (GNOME and others) commonly grab
+Ctrl+Alt+Arrows, which is why upstream avoids them on Linux. A shortcut that
+does nothing is most likely grabbed by the desktop: every action stays
+reachable from the command palette and remappable. DBased never defaults to
+Ctrl+Alt+D or Ctrl+Alt+L (common desktop "show desktop" / "lock screen").
+
+**What upstream gives and what DBased builds.** Upstream has add cursor
+above/below, Alt+click, column selection (Alt+Shift+drag, Ctrl+Alt+drag on
+Linux), undo/redo, search/replace, indent/outdent, word movement, and the
+public `add_selection`, `set_selected_range`, `selected_range`, `cursor`
+and `selected_text`. Select all occurrences is built on `add_selection`
+(5,000 selections in about 75 ms in the spike). The selection list, the undo
+manager and `add_cursor_at` are private and there is no public selection-count
+getter, so multi-selection-aware move and copy line with one undo step, skip
+occurrence, undo last cursor and smart multi-cursor need upstream API first
+(OPEN-6: upstream-first, a pinned fork only until the PR merges).
+
+**Why.** VS Code is the editor most of the target users already know, and the
+Constitution names it as the UX reference. Presets still let DBeaver users keep
+their muscle memory. The keymap layer is needed anyway for the multi-cursor
+commands (OPEN-6), so it is not extra scope. Serves UX.
+
+**Trade-off.** A keymap indirection layer, required regardless by OPEN-6. The
+default differs from VS Code on Linux and from the editor's upstream Linux
+bindings, so it must be documented in the keymap help. Several commands wait on
+upstream API.
 
 ### 9.5 Nested-query fragment debugging (Later)
 
@@ -2524,18 +2575,29 @@ the programmatic equivalent of Alt-clicking another cursor.
    atomicity across cursors and multi-cursor painting.
 2. Build **select-next-occurrence** (Ctrl+D) and **select-all-occurrences**
    (Ctrl+Shift+L) in `ui` on top of `add_selection`, as keymap-layer actions
-   (9.4), including skip-occurrence.
-3. Multi-cursor-aware completion (primary-cursor only until then).
-4. Anything missing or buggy found in the spike is fixed **upstream first**:
-   open a design issue, follow the project's contribution rules, carry a pinned
-   fork/branch (0.1) only until the PR merges.
+   (9.4), then skip occurrence, undo last cursor, move and copy line, and
+   toggle line comment. *(Revised 2026-11, editor UX.)* The full default
+   mapping and what each command needs from upstream are in 9.4.
+3. Smart multi-cursor (9.4.1), on by default.
+4. Multi-cursor-aware completion (primary-cursor only until then).
+5. Anything missing or buggy is fixed **upstream first**: open a design
+   issue, follow the project's contribution rules, carry a pinned fork/branch
+   (0.1) only until the PR merges. Known upstream asks: a public getter for
+   the selections (also needed by tests, 7.1), atomic multi-selection edits
+   for one undo step, removing the last added selection, and adding a cursor
+   at a position without a click.
 
 The editor stays behind the swappable sub-component interface (6.1), so the
 fallback paths (a wrapped or custom editor element) remain available.
 
 ### Still open
 
-- Default keymap preset (9.4): recommendation DBeaver-like.
+- Default keymap mapping (9.4): the default preset is VS Code-like (decided
+  2026-11). To confirm: keep the requested mapping on Linux too (Shift+Alt
+  copies lines, Ctrl+Alt adds cursors, as VS Code on Windows and macOS), or
+  follow VS Code on Linux (Shift+Alt adds cursors, Ctrl+Shift+Alt copies
+  lines). Also to confirm: `Ctrl+.` opens DBased's symbol picker instead of
+  upstream code actions (6.1).
 - Documentation strategy is being defined separately and, once agreed, becomes
   its own standard (and likely a Constitution pillar).
 - Part 10 remaining checks (gate status there): CJK composition with a real
@@ -2625,7 +2687,8 @@ philosophy are named out loud rather than hidden.
   grid element, instead of building one up front.
 - **Editor below Monaco vs UX First.** 0.4 and 6.1 accept a weaker editor (rich
   find-and-replace, minimap, folding, snippets, VS Code keymap absent) as the
-  price of the GPUI bet. Contained to `ui`.
+  price of the GPUI bet. Contained to `ui`. The VS Code-like keymap is rebuilt
+  in-house (9.4), partly waiting on upstream API.
 - **Dependency count vs "fewer dependencies".** GPUI, gpui-component, sqlx,
   sqlparser, the keyring stores, etcetera and the later russh each carry weight.
   Each is justified at its decision; the GPUI stack specifically is the cost of
