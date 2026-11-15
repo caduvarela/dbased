@@ -1422,7 +1422,8 @@ dependencies = [
 name = "dbased-commands"
 version = "0.1.0"
 dependencies = [
- "serde",
+ "async-channel",
+ "secrecy",
 ]
 
 [[package]]

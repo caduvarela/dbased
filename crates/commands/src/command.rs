@@ -1,28 +1,65 @@
-use serde::{Deserialize, Serialize};
+use crate::{
+    ConnectionId, ConnectionSettings, ExecuteTarget, MetadataNode, PasswordSource, PasswordUpdate,
+    RequestId, ResultId, TabId,
+};
 
-/// Identifies one unit of asynchronous work so events can be matched to requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct JobId(pub u64);
-
-/// Placeholder connection description; secrets never travel here, only a reference.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConnectionConfig {
-    pub name: String,
-    pub url: String,
-}
-
-/// Requests the UI sends to the core.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Requests the UI sends to the Core. No `PartialEq`: secrets cannot be compared.
+#[derive(Debug, Clone)]
 pub enum Command {
-    OpenConnection {
-        job: JobId,
-        config: ConnectionConfig,
+    SaveConnection {
+        request: RequestId,
+        id: Option<ConnectionId>,
+        settings: ConnectionSettings,
+        password: PasswordUpdate,
     },
-    ExecuteQuery {
-        job: JobId,
-        sql: String,
+    DeleteConnection {
+        request: RequestId,
+        id: ConnectionId,
     },
-    CancelQuery {
-        job: JobId,
+    TestConnection {
+        request: RequestId,
+        id: Option<ConnectionId>,
+        settings: ConnectionSettings,
+        password: PasswordSource,
+    },
+    Connect {
+        request: RequestId,
+        id: ConnectionId,
+        password: PasswordSource,
+    },
+    Disconnect {
+        request: RequestId,
+        id: ConnectionId,
+    },
+    OpenTab {
+        tab: TabId,
+        connection: ConnectionId,
+    },
+    CloseTab {
+        tab: TabId,
+    },
+    Execute {
+        request: RequestId,
+        tab: TabId,
+        script: String,
+        target: ExecuteTarget,
+    },
+    /// `request` is the `Execute` request to stop.
+    Cancel {
+        tab: TabId,
+        request: RequestId,
+    },
+    FetchRows {
+        result: ResultId,
+        start: u64,
+        count: u32,
+    },
+    ReleaseResult {
+        result: ResultId,
+    },
+    LoadChildren {
+        request: RequestId,
+        connection: ConnectionId,
+        node: MetadataNode,
     },
 }

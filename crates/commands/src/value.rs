@@ -1,7 +1,5 @@
-use serde::{Deserialize, Serialize};
-
 /// A single database cell, normalized across drivers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -19,7 +17,7 @@ pub enum Value {
 }
 
 /// Column metadata; travels once per result, ahead of the rows (docs/PROJECT.md 2.5).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnMeta {
     pub name: String,
     /// The database's own type name, as reported with the result.

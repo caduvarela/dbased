@@ -14,6 +14,7 @@ dbased-core = { path = "crates/core" }
 dbased-sql = { path = "crates/sql" }
 dbased-ui = { path = "crates/ui" }
 
+async-channel = "2"
 async-trait = "0.1"
 etcetera = "0.11"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
