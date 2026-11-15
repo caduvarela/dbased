@@ -1,5 +1,9 @@
-//! Test support: one Postgres container per test binary, one database per test.
-//! The image comes from the repo-root `.env` so versions never drift (docs/PROJECT.md Part 7).
+//! Test support: one database container per test binary, one database per test.
+//! The images come from the repo-root `.env` so versions never drift (docs/PROJECT.md Part 7).
+// @NOTE: each test binary uses only its own database's helpers.
+#![allow(dead_code)]
+
+pub mod mysql;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
