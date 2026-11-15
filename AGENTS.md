@@ -34,6 +34,8 @@ Hard rules (enforced by the compiler and checked with `cargo tree`):
 
 ## Commands
 
+Linux build prerequisites (Debian/Ubuntu): `build-essential pkg-config cmake libfontconfig1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libx11-xcb-dev libxcb-xkb-dev libasound2-dev libssl-dev libvulkan1 mesa-vulkan-drivers`. Run the app with `cargo run -p dbased-app` (binary `dbased`).
+
 ```
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
