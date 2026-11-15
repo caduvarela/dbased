@@ -1844,8 +1844,12 @@ Recorded after the first Postgres slice and an independent review:
   pool lazily, so typed connect errors surface at once. The first cancel can
   therefore pay the pool's first connect and fall back to the one-off cancel
   connection.
-- **Describe runs on the user's session** (Parse of the user SQL). Inside a
-  transaction it can block on locks; a timeout closes the session.
+- **Describe runs on the user's session** (Parse/Describe of the user SQL),
+  so headers reach the UI before a slow statement finishes. It runs only for
+  row-returning statements outside a transaction (a failed Parse would abort
+  an open transaction; unknown state counts as inside). Cancel during Parse
+  follows the normal cancel policy. Cost: one extra Parse round trip per
+  statement. Inside a transaction, headers still arrive with the first row.
 - **Abnormal close** (drain timeout, error, dropped future, failed health
   check) cancels the backend while the connection is still held, then drops
   the socket. A dropped `execute` future is only cancelled on the next call or
