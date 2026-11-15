@@ -21,6 +21,7 @@ pub(super) struct SessionLog {
     pub(super) executed: Mutex<Vec<String>>,
     pub(super) order: Mutex<Vec<&'static str>>,
     pub(super) opens: AtomicUsize,
+    pub(super) exports: AtomicUsize,
     pub(super) closes: AtomicUsize,
     pub(super) started: AtomicUsize,
     pub(super) slow_rows_sent: AtomicBool,
@@ -66,6 +67,13 @@ async fn stream_rows(sink: &RowSink, count: u64) {
         let row = vec![Value::Int(i64::try_from(number).unwrap())];
         sink.send(RowSinkMessage::Row(row)).await.unwrap();
     }
+}
+
+async fn finish(sink: &RowSink, result: StatementOutcome) -> Result<StatementOutcome, CoreError> {
+    sink.send(RowSinkMessage::Outcome(result.clone()))
+        .await
+        .unwrap();
+    Ok(result)
 }
 
 #[async_trait]
@@ -141,6 +149,54 @@ impl Session for ScriptedSession {
                 self.log.slow_rows_sent.store(true, Ordering::SeqCst);
                 outcome(StatementStatus::Completed, argument)
             }
+            "paced" => {
+                sink.send(RowSinkMessage::Columns(column())).await.unwrap();
+                let mut sent = 0;
+                for number in 0..argument {
+                    if token.is_cancelled() {
+                        let mut cancelled = outcome(StatementStatus::Cancelled, sent);
+                        cancelled.partial = true;
+                        return finish(&sink, cancelled).await;
+                    }
+                    let row = vec![Value::Int(i64::try_from(number).unwrap())];
+                    sink.send(RowSinkMessage::Row(row)).await.unwrap();
+                    sent += 1;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                outcome(StatementStatus::Completed, sent)
+            }
+            "mixed" => {
+                let columns = ["id", "note"].map(|name| ColumnMeta {
+                    name: name.into(),
+                    type_name: "text".into(),
+                    nullable: None,
+                });
+                sink.send(RowSinkMessage::Columns(columns.to_vec()))
+                    .await
+                    .unwrap();
+                let rows = [
+                    vec![Value::Int(1), Value::Text("a,b".into())],
+                    vec![Value::Int(2), Value::Null],
+                    vec![Value::Int(3), Value::Text("line\nbreak \"q\"".into())],
+                    vec![Value::Int(4), Value::Text(String::new())],
+                ];
+                for row in rows {
+                    sink.send(RowSinkMessage::Row(row)).await.unwrap();
+                }
+                outcome(StatementStatus::Completed, 4)
+            }
+            "failafter" => {
+                stream_rows(&sink, argument).await;
+                let mut failed = outcome(StatementStatus::Failed, argument);
+                failed.server_error = Some(DatabaseErrorInfo {
+                    sqlstate: "22012".into(),
+                    message: "division by zero".into(),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                });
+                failed
+            }
             "dead" => return Err(CoreError::SessionClosed(CloseReason::ConnectionError)),
             "deadrows" => {
                 stream_rows(&sink, 2).await;
@@ -171,10 +227,7 @@ impl Session for ScriptedSession {
                 outcome(StatementStatus::Completed, 1)
             }
         };
-        sink.send(RowSinkMessage::Outcome(result.clone()))
-            .await
-            .unwrap();
-        Ok(result)
+        finish(&sink, result).await
     }
 
     async fn health_check(&mut self) -> Result<SessionHealth, CoreError> {

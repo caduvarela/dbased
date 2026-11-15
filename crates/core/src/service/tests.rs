@@ -44,6 +44,11 @@ impl Driver for ScriptedDriver {
         }))
     }
 
+    async fn open_export_session(&self) -> Result<Box<dyn Session>, CoreError> {
+        self.sessions.exports.fetch_add(1, Ordering::SeqCst);
+        self.open_session().await
+    }
+
     async fn list_schemas(&self) -> Result<Vec<Schema>, CoreError> {
         Ok(vec![
             Schema {
@@ -303,7 +308,8 @@ pub(super) fn terminal_request(event: &Event) -> Option<RequestId> {
         | Event::RequestCompleted { request }
         | Event::RequestFailed { request, .. }
         | Event::ChildrenLoaded { request, .. }
-        | Event::ExecutionFinished { request, .. } => Some(*request),
+        | Event::ExecutionFinished { request, .. }
+        | Event::ExportFinished { request, .. } => Some(*request),
         _ => None,
     }
 }

@@ -5,6 +5,7 @@
 mod connector;
 mod dispatcher;
 mod error_info;
+mod export;
 mod results;
 mod secrets;
 mod store;
@@ -12,6 +13,8 @@ mod tab;
 
 #[cfg(test)]
 mod execution_tests;
+#[cfg(test)]
+mod export_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

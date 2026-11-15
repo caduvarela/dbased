@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_channel::{Receiver, Sender};
 use dbased_commands::{
-    Command, ConnectionId, ConnectionSettings, ConnectionState, ConnectionSummary, DatabaseKind,
-    ErrorInfo, Event, ExecuteTarget, MetadataItem, MetadataItemKind, MetadataNode, PasswordSource,
-    PasswordUpdate, RequestId, ResultId, TabId,
+    Command, ConnectionId, ConnectionSettings, ConnectionState, ConnectionSummary, CsvOptions,
+    DatabaseKind, ErrorInfo, Event, ExecuteTarget, MetadataItem, MetadataItemKind, MetadataNode,
+    PasswordSource, PasswordUpdate, RequestId, ResultId, TabId,
 };
 use secrecy::SecretString;
 use tokio::sync::oneshot;
@@ -13,6 +14,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::error_info::error_info;
+use super::export::{ExportJob, run_export};
 use super::results::ResultStore;
 use super::store::StoredConnection;
 use super::tab::{PendingExecute, TabHandle, TabMessage, dialect_of, spawn_tab};
@@ -41,7 +43,18 @@ enum Completion {
     Closed {
         request: Option<RequestId>,
     },
+    ExportEnded {
+        request: RequestId,
+    },
     Done,
+}
+
+/// A running export (docs/PROJECT.md 3.1). `finished` resolves when its task ends, so a
+/// disconnect can wait for the dedicated session to close before the pool does.
+struct ExportEntry {
+    connection: ConnectionId,
+    token: CancellationToken,
+    finished: oneshot::Receiver<()>,
 }
 
 /// One task owns all service state. It never awaits database I/O: anything slower than a map
@@ -53,6 +66,7 @@ pub(super) struct Dispatcher {
     events: Sender<Event>,
     connections: BTreeMap<ConnectionId, ConnectionEntry>,
     tabs: HashMap<TabId, TabHandle>,
+    exports: HashMap<RequestId, ExportEntry>,
     results: ResultStore,
     // @NOTE: set when the config file could not be read, so a save never overwrites it blindly.
     storage_blocked: Option<String>,
@@ -69,6 +83,7 @@ impl Dispatcher {
             events,
             connections: BTreeMap::new(),
             tabs: HashMap::new(),
+            exports: HashMap::new(),
             results: ResultStore::default(),
             storage_blocked: None,
             tasks: JoinSet::new(),
@@ -156,6 +171,21 @@ impl Dispatcher {
             Command::Cancel { tab, request } => {
                 if let Some(handle) = self.tabs.get(&tab) {
                     handle.running.cancel(request);
+                }
+            }
+            Command::ExportCsv {
+                request,
+                connection,
+                sql,
+                path,
+                options,
+            } => {
+                self.export_csv(request, connection, sql, path, options)
+                    .await;
+            }
+            Command::CancelExport { request } => {
+                if let Some(entry) = self.exports.get(&request) {
+                    entry.token.cancel();
                 }
             }
             Command::FetchRows {
@@ -349,7 +379,8 @@ impl Dispatcher {
             self.fail(pending.request, &CoreError::UnknownConnection)
                 .await;
         }
-        let closing_tabs = self.close_tabs_of(id);
+        let mut closing_tabs = self.cancel_exports_of(id);
+        closing_tabs.extend(self.close_tabs_of(id));
         let secret_result = self.delete_secret(id).await;
         self.emit_connections_changed().await;
 
@@ -381,8 +412,8 @@ impl Dispatcher {
     }
 
     /// Cancels what is running and asks every tab of the connection to close its session.
-    fn release_sessions(&self, connection: ConnectionId) -> Vec<oneshot::Receiver<()>> {
-        let mut released = Vec::new();
+    fn release_sessions(&mut self, connection: ConnectionId) -> Vec<oneshot::Receiver<()>> {
+        let mut released = self.cancel_exports_of(connection);
         for handle in self
             .tabs
             .values()
@@ -399,6 +430,24 @@ impl Dispatcher {
             }
         }
         released
+    }
+
+    /// Cancels the connection's exports and hands back what resolves when they have ended.
+    fn cancel_exports_of(&mut self, connection: ConnectionId) -> Vec<oneshot::Receiver<()>> {
+        let requests: Vec<RequestId> = self
+            .exports
+            .iter()
+            .filter(|(_, entry)| entry.connection == connection)
+            .map(|(request, _)| *request)
+            .collect();
+        requests
+            .into_iter()
+            .filter_map(|request| self.exports.remove(&request))
+            .map(|entry| {
+                entry.token.cancel();
+                entry.finished
+            })
+            .collect()
     }
 
     fn close_tabs_of(&mut self, connection: ConnectionId) -> Vec<oneshot::Receiver<()>> {
@@ -688,11 +737,64 @@ impl Dispatcher {
         });
     }
 
+    async fn export_csv(
+        &mut self,
+        request: RequestId,
+        connection: ConnectionId,
+        sql: String,
+        path: PathBuf,
+        options: CsvOptions,
+    ) {
+        if self.exports.contains_key(&request) {
+            let error = CoreError::Internal("the export request id is already running".into());
+            self.fail(request, &error).await;
+            return;
+        }
+        let Some(entry) = self.connections.get(&connection) else {
+            self.fail(request, &CoreError::UnknownConnection).await;
+            return;
+        };
+        let Some(driver) = entry.driver.clone() else {
+            let error = CoreError::Connection("the connection is not open".to_owned());
+            self.fail(request, &error).await;
+            return;
+        };
+        let token = CancellationToken::new();
+        let (done, finished) = oneshot::channel();
+        self.exports.insert(
+            request,
+            ExportEntry {
+                connection,
+                token: token.clone(),
+                finished,
+            },
+        );
+        let job = ExportJob {
+            request,
+            sql,
+            path,
+            options,
+            dialect: dialect_of(entry.settings.kind),
+            token,
+            events: self.events.clone(),
+        };
+        let events = self.events.clone();
+        self.tasks.spawn(async move {
+            let terminal = run_export(driver, job).await;
+            events.send(terminal).await.ok();
+            done.send(()).ok();
+            Completion::ExportEnded { request }
+        });
+    }
+
     async fn complete(&mut self, joined: Result<Completion, JoinError>) {
         // @NOTE: a panicked task cannot say which request it served; it is dropped here.
         let Ok(completion) = joined else { return };
         match completion {
             Completion::Done => {}
+            Completion::ExportEnded { request } => {
+                self.exports.remove(&request);
+            }
             Completion::Closed { request } => {
                 if let Some(request) = request {
                     self.emit(Event::RequestCompleted { request }).await;
@@ -765,6 +867,9 @@ impl Dispatcher {
     /// Closes every tab session first, then every pool (11.2).
     async fn shut_down(&mut self) {
         self.shutting_down = true;
+        for entry in self.exports.values() {
+            entry.token.cancel();
+        }
         let handles: Vec<TabHandle> = self.tabs.drain().map(|(_, handle)| handle).collect();
         for handle in handles {
             self.close_handle(handle);
