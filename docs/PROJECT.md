@@ -1114,6 +1114,13 @@ snapshot from October 2025 and must not be mixed in. Therefore:
   recorded in the workspace manifest;
 - upgrades are deliberate and scheduled (roughly monthly, or when a needed fix
   lands), never automatic, and happen on their own branch;
+- *(spike, 2026-11)* the UI also needs two things the default set lacks:
+  gpui-component's `tree-sitter-sql` feature (SQL highlighting) and a direct
+  `gpui-base` dependency (the Dock lives there, and the `AddCursorAbove` /
+  `AddCursorBelow` actions are not re-exported by `gpui_component::input`).
+  Both are declared only in `crates/ui` (added with the first code that uses
+  them), `gpui-base` is exact-pinned to the same version as gpui-component and
+  upgraded in lockstep with it, and neither ever reaches `core`;
 - escape hatches, in order: vendor the pinned crates (`cargo vendor`);
   switch to a git revision of Zed's `gpui` if gpui-component stays compatible;
   the community fork `gpui-ce`; and, as a last resort, a different frontend
@@ -1167,31 +1174,35 @@ Core. Bounded channels give natural backpressure.
 **Trade-off.** Two executors to reason about. Standard for a native UI plus an
 async I/O core.
 
-### 0.4 Superseded Tauri-era UI decisions *(revised 2026-11)*
+### 0.4 Superseded Tauri-era UI decisions *(revised 2026-11, spike)*
 
 These earlier decisions are replaced by their gpui-component equivalents. The
 Core-side decisions they depended on are unaffected.
 
 - **SQL editor:** Monaco (and its lazy-load, see 6.1) is replaced by
   gpui-component's native code editor (Tree-sitter highlighting, line numbers,
-  find, soft wrap, tab config, LSP-capable, advertised as stable at ~200K
-  lines). No webview, so the startup-budget concern no longer applies. Honest
+  find, soft wrap, tab config, LSP-capable). Its own docs target about 50K
+  lines; the spike opened 100K lines acceptably (Part 10, item 2). No webview,
+  so the startup-budget concern no longer applies. Honest
   scope: this editor is *sufficient* for a SQL client, not *equivalent* to
   Monaco. Rich find-and-replace, minimap, code folding, snippets and a VS Code
   keymap are not provided. **Multi-cursor now exists upstream** (Alt-click,
   add-cursor-above/below, and a public `add_selection` API merged in October
   2026); see OPEN-6. Contained to `ui`.
 - **Data grid:** TanStack Table/Virtual is replaced by gpui-component's
-  virtualized `Table`. Its documented scale is hundreds of thousands of rows,
-  not millions, so the grid is always fed by windowed fetches from the Core
-  (2.3, 2.4); this is a requirement, not an optimization.
+  virtualized `Table`. Its rows are virtual (the delegate reports a row count
+  and renders cells on demand; only visible rows are requested), verified at
+  5,000,000 logical rows. The grid is still always fed by windowed fetches from
+  the Core (2.3, 2.4): cell access is synchronous, so rows must already be in a
+  small UI-side window cache when painted (6.3).
 - **UI state:** Zustand is replaced by GPUI entities. The boundary in 6.2
   (bulk result rows stay out of global app state) still holds: large row buffers
   live in Core (2.3), not in UI entities.
-- **Docking:** gpui-component's **Dock** (resizable panels, draggable tabs,
-  nested splits, serializable layout). The earlier "Dock + Tiles" wording is
-  superseded: no Tiles module was found in 0.9.x. Freeform tiling is not an MVP
-  requirement. Layout persists into the workspace file (5.2).
+- **Docking:** gpui-component's **Dock** (in `gpui-base`; resizable panels,
+  draggable tabs, nested splits, serializable layout). Placements are only
+  left, right, bottom and center: there are **no Tiles and no floating,
+  popup or detached panels** in 0.9.x, and none are planned for the MVP.
+  Layout persists per workspace (5.2, 6.3).
 - **IPC type generation:** `tauri-specta` is not used; 0.2 replaces it.
 
 ### 0.5 What this change does NOT touch
@@ -1496,9 +1507,10 @@ ad-hoc SQL → sqlx stream → Core bounded buffer → session free
                           UI requests pages (0–200, ...)
 ```
 
-The grid never receives the full buffer: it asks for the visible window, since
-the table widget is documented for hundreds of thousands of rows, not millions
-(0.4).
+The grid never receives the full buffer: it asks for the windows around the
+visible range and keeps only a small bounded cache of them (6.3). The grid was
+verified at 5,000,000 logical rows (Part 10); a row cap configured above that
+is untested for scroll precision.
 
 **Why.** Honors "never load millions of rows" while keeping paging instant
 (it reads from RAM, not the wire). Serves Performance and Simplicity.
@@ -1779,6 +1791,8 @@ reuses the result buffer and never holds the whole file in memory. It is a Job,
 emits progress on a channel, and is cancellable like any other. The writer
 emits UTF-8 and offers an optional BOM for spreadsheet compatibility. JSON and
 NDJSON are cheap follow-ups through `serde_json`; Parquet is a later milestone.
+Export and large copy-to-clipboard are always Core jobs, never driven through
+the grid widget (its `dump` helpers call the delegate for every row, see 6.3).
 
 **Why.** Export is the one operation that legitimately touches the full result
 set; it must not inherit the row cap. Streaming to disk keeps memory flat for
@@ -1917,16 +1931,25 @@ re-typing) and security.
 with gnome-keyring only (Part 10, item 7); macOS, Windows and KWallet are
 verified when those targets are first built.
 
-### 5.2 Configuration and workspace files *(revised 2026-11)*
+### 5.2 Configuration and workspace files *(revised 2026-11, spike)*
 
 **Decision.** Storage is split by data shape, not forced into one store:
 
 - **Human-facing config in a TOML file** (located via `etcetera`, XDG on Linux
   and macOS, no Tauri dependency; `directories` was dropped after 10 months
-  without a release): connection metadata, settings, and workspace + dock
-  layout. Read and written with `toml` + `serde`; rewrites of an existing
-  user-edited file use `toml_edit` so comments survive. Written with atomic
-  replace (temp file, then rename) so a crash mid-write cannot corrupt it.
+  without a release): connection metadata, settings, and the workspace (open
+  tabs and their connections). Read and written with `toml` + `serde`; rewrites
+  of an existing user-edited file use `toml_edit` so comments survive. Written
+  with atomic replace (temp file, then rename) so a crash mid-write cannot
+  corrupt it.
+- **Dock layout in a separate JSON file per workspace** *(spike, 2026-11)*.
+  The Dock serializes to a deeply nested tree with arbitrary JSON panel state
+  (`DockAreaState`), which TOML represents badly, and nobody edits it by hand.
+  The UI serializes it with `serde_json` and hands it to the Core as an opaque
+  string through a `Command`; the Core writes it atomically without knowing its
+  shape, so `core` stays free of GPUI types. A layout that fails to load (for
+  example after a gpui-component upgrade changed the format) falls back to the
+  default layout, never blocks startup, and the old file is kept as a backup.
 - **Machine-managed, append-heavy data in SQLite**: query history first (later,
   saved snippets and cached metadata snapshots if they earn it). SQLite is
   reused through sqlx's sqlite backend, so it is **not a new major dependency**
@@ -1941,10 +1964,12 @@ and needs indexed search and cheap incremental writes, which a flat file handles
 badly and SQLite handles well. Serves Simplicity, Performance, and the
 Constitution's human-readable-config preference.
 
-**Trade-off.** Two stores instead of one. The boundary is unambiguous: if a human
-edits it, it is the TOML file; if the app appends to it at runtime, it is SQLite.
-TOML is awkward for deeply nested structures; the workspace schema must stay
-reasonably flat.
+**Trade-off.** Two stores plus a layout file instead of one store. The boundary
+is unambiguous: if a human edits it, it is the TOML file; if the app appends to
+it at runtime, it is SQLite; the Dock's own tree is an opaque JSON file. TOML
+is awkward for deeply nested structures; the workspace schema must stay
+reasonably flat. The layout format belongs to gpui-component and may break on
+upgrades; losing a layout is acceptable, losing tabs or connections is not.
 
 ### 5.3 Transport security *(new 2026-11, revised after spike)*
 
@@ -1984,29 +2009,43 @@ to loopback on an ephemeral port only.
 These sections are the GPUI-era replacements for the superseded Tauri-era UI
 decisions listed in 0.4. They live entirely in the `ui` crate.
 
-### 6.1 SQL editor *(revised 2026-11)*
+### 6.1 SQL editor *(revised 2026-11, spike)*
 
-**Decision.** Use gpui-component's native code editor for the SQL editor.
+**Decision.** Use gpui-component's native code editor (`EditorState` with
+`.language("sql")`) for the SQL editor; it is used as provided, not rebuilt.
 Capabilities and honest limits are recorded in 0.4. No lazy-load gymnastics are
 needed (it is native, not a webview), so there is no startup penalty to schedule
 around. The editor is treated as a **swappable sub-component behind an
 interface** (UI exchanges SQL text, selections and completion requests), so it
 can be replaced or wrapped without touching the rest of `ui`.
 
+*(Spike, 2026-11.)* SQL highlighting needs the `tree-sitter-sql` feature and
+the multi-cursor actions need `gpui-base` (0.1). Large files: the editor's
+own docs target about 50K lines; a 100K-line file opened in about 0.3 s and
+edited at under 9 ms per keystroke, but RSS grew from 127 MB after open to
+about 295-385 MB. The editor is for scripts, not dumps: files above the
+upstream target (about 50K lines or 5 MB, to be tuned) open only after a
+warning that names the size. Editor memory is a **watch item, not a budget**,
+until it is known whether the growth is a one-time cost (highlighting, layout)
+or grows with edits; the latter would be a defect to fix upstream.
+
 **Why.** Native, Tree-sitter highlighted, LSP-capable, GPU-rendered. Covers a SQL
 client's editing needs without a webview. Serves Performance and Simplicity.
 
 **Trade-off.** Below Monaco in power (see 0.4). Multi-cursor basics exist
-upstream; the VS Code-style commands built on them are tracked as OPEN-6.
-IME quality (notably CJK) and Wayland behavior are unverified and are part of
-the week-one spike (Part 10). Contained to `ui` either way.
+upstream; the VS Code-style commands built on them are tracked as OPEN-6. The
+input component exposes no IME preedit/commit callbacks (only
+`marked_text_range` and Change / PressEnter / Focus / Blur events), so IME,
+dead keys and paste quality can only be checked by a manual checklist on X11
+and Wayland (Part 10, item 3). Contained to `ui` either way.
 
-### 6.2 UI state
+### 6.2 UI state *(revised 2026-11, spike)*
 
 **Decision.** UI state lives in GPUI entities (owned by the GPUI `App`), sliced by
 concern: connections, open tabs, explorer/metadata view-models, jobs. Large
 result-set rows do **not** live in UI entities; they stay in the Core buffer (2.3)
-and the grid reads pages from there.
+and the grid reads pages from there. The only rows the UI holds are the grid's
+small, bounded window cache of display strings (6.3).
 
 **Why.** Keeping bulk rows out of UI state preserves the virtualization win and
 keeps UI updates cheap. Matches the Constitution's "keep state simple" and
@@ -2015,23 +2054,59 @@ keeps UI updates cheap. Matches the Constitution's "keep state simple" and
 **Trade-off.** Two homes for state (UI view-models vs Core buffers). The boundary
 is clear: shared UI facts in entities, bulk data in Core.
 
-### 6.3 Grid, tree, and docking *(revised 2026-11)*
+### 6.3 Grid, tree, and docking *(revised 2026-11, spike)*
 
-**Decision.** The data grid is gpui-component's virtualized `Table`, fed by
-windowed fetches (2.3); the explorer tree and history use its virtualized
-`List` / `tree`; panel arrangement uses its **Dock** (resizable panels,
-draggable tabs, nested splits, serializable layout). The grid consumes the
-columns-once / rows-as-arrays payload from 2.5 directly. Dock layout persists to
-the workspace file (5.2). Grid and editor are wrapped behind our own traits so a
-custom element built on `gpui-base` primitives can replace either if a limit is
-hit.
+**Decision.** The data grid is gpui-component's virtualized `Table`, kept as
+is, fed by windowed fetches (2.3); the explorer tree and history use its
+virtualized `List` / `tree`; panel arrangement uses its **Dock** (resizable
+panels, draggable tabs, nested splits, serializable layout). The grid consumes
+the columns-once / rows-as-arrays payload from 2.5 directly. Grid and editor are
+wrapped behind our own traits so a custom element built on `gpui-base`
+primitives can replace either if a limit is hit.
 
-**Why.** All three are provided and GPU-virtualized. Removes the need to build or
+*(Spike, 2026-11.)* Grid rules:
+
+- The `TableDelegate` reports the row count and renders each cell on demand;
+  `visible_rows_changed` requests the windows around the visible range (200
+  rows each) from the Core, and requests for windows already scrolled past are
+  dropped. The UI keeps a small LRU of windows as display-ready strings (the
+  spike used 24 windows, 4,800 rows); bulk rows stay in the Core (6.2).
+- `render_td` is O(1): a lookup and a clone, no formatting or decoding. Cells
+  of a window not yet arrived render a deliberate loading state (a muted
+  skeleton of the same height), never a layout shift.
+- **Frame budget.** The grid repaints only on change (scroll, window arrival,
+  selection, resize); an idle grid renders no frames. Scroll APIs such as
+  `scroll_to_row` are called only when the target row changes, never per frame
+  (each call notifies). Window arrivals notify once per window (cheap: about
+  100 notifies/s while flinging still gave one render per frame). The grid's
+  render cost must stay **under 8 ms of CPU per frame** on the reference
+  machine at the default window size; the spike measured 8-11 ms (including
+  its stats overlay), which leaves no headroom under CPU contention (frames
+  then fall to 30 fps). Profiling and reducing that cost is part of the grid
+  milestone; if the Table's own per-cell overhead cannot be brought under the
+  budget, that is the trigger for the custom element above.
+- Sorting is a delegate callback that sends a `Command` to the Core and reloads
+  the windows; export and large copies are Core jobs (3.3), never the Table's
+  `dump` / `dump_range`.
+
+Dock rules: placements are left, right, bottom and center only (0.4). Panels
+are registered with `register_panel(name, builder)` keyed by `panel_name()`,
+wrapped with `panel_handle` and added with `panel_view` / `add_panel_view`
+(plain `add_panel` loses tab titles). Layout round-trips through
+`DockArea::dump` / `load` (sizes and per-panel state included) and persists as
+the opaque per-workspace JSON file in 5.2. Unknown panel names restore as
+placeholders that keep their state. The panel registry is a library-owned
+global, accepted because it is confined to `ui`.
+
+**Why.** All three are provided and GPU-virtualized, and the spike confirmed the
+Table virtualizes rows rather than holding them. Removes the need to build or
 wire TanStack-equivalents. Serves Performance and the Constitution's
 virtualization mandate.
 
 **Trade-off.** Tied to gpui-component's component APIs, which are pre-1.0 and
-change on minor versions. Contained to `ui` and pinned per 0.1.
+change on minor versions. Contained to `ui` and pinned per 0.1. The grid's
+fixed per-frame cost is the tightest performance margin in the UI; 120/144 Hz
+displays (6.9-8.3 ms per frame) are not reachable at today's cost.
 
 ---
 
