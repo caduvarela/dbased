@@ -1855,23 +1855,42 @@ invasive server-side hooks (event triggers), which a client must not install.
 
 ## Part 5 — Persistence and Security
 
-### 5.1 Credential storage *(revised 2026-11)*
+### 5.1 Credential storage *(revised 2026-11, spike)*
 
 **Decision.** Passwords are stored in the OS keychain through the `keyring`
 ecosystem. `keyring` 4.x is split into `keyring-core` (the `Entry` API) plus one
 crate per platform credential store; DBased depends on `keyring-core` and the
 stores directly, selected per target OS, rather than on the umbrella crate:
 
-- Linux: `zbus-secret-service-keyring-store` (pure Rust, tokio-compatible; also
-  reaches KWallet, which implements the Secret Service API).
-- macOS: `apple-native-keyring-store`.
-- Windows: `windows-native-keyring-store`.
+- Linux: `zbus-secret-service-keyring-store` (pure Rust, no system packages)
+  with exactly one runtime feature, `rt-tokio-crypto-rust` (the store has no
+  default runtime; tokio is already in `core`). The libdbus-based store is
+  rejected: it needs `libdbus-1-dev` to build. KWallet should work through its
+  Secret Service API but is untested.
+- macOS: `apple-native-keyring-store` (resolves, not yet compiled).
+- Windows: `windows-native-keyring-store` (resolves, not yet compiled).
+
+Wiring: the store is created once at Core startup and held as injected Core
+state (entries are built from it, not from a process-wide default store).
+Every keyring call is blocking, and an unlock prompt can block indefinitely,
+so calls run on `spawn_blocking` and are never on the connect critical path:
+while a prompt is pending the UI offers "enter password instead". Errors map
+by variant (the enum is non-exhaustive, so there is a catch-all):
+`NoEntry` means no saved password, `NoStorageAccess` (locked or dismissed)
+means prompt for this connect, `PlatformFailure` (no D-Bus or no Secret
+Service) means the store is unavailable for this run, with the platform
+error's text kept as detail. The Core does not downcast to `secret_service` /
+`zbus` errors: that would need both as direct dependencies kept in lockstep
+with the store's, to change only a message.
 
 The workspace config file stores only non-secret connection metadata (host,
 port, database, user, options) plus a key referencing the keychain entry.
-Plaintext passwords are never written to disk. In memory, secrets are held in
-`secrecy::SecretString`, wiped with `zeroize` after use, and excluded from
-`Debug` and log output.
+Plaintext passwords are never written to disk. In DBased's own code, secrets
+are held in `secrecy::SecretString` and excluded from `Debug` and log output.
+**Known limit, stated rather than overpromised:** `secrecy` only limits copies
+on our side. `keyring-core` returns a plain `String`, D-Bus buffers hold the
+secret, and sqlx's connect options keep the password in memory for the pool's
+lifetime so it can open new connections.
 
 If no Secret Service provider is present on Linux, the app falls back to
 prompting per session, and may later offer an explicit, encrypted-file store as
@@ -1881,9 +1900,9 @@ a user opt-in (not a silent default).
 directly keeps the dependency tree small and per-platform. Serves UX (no
 re-typing) and security.
 
-**Trade-off.** Slightly more wiring than a single crate. The exact store setup
-is validated in the week-one spike (Part 10), since it was not compiled against
-during this review.
+**Trade-off.** Slightly more wiring than a single crate. Validated on Linux
+with gnome-keyring only (Part 10, item 7); macOS, Windows and KWallet are
+verified when those targets are first built.
 
 ### 5.2 Configuration and workspace files *(revised 2026-11)*
 
@@ -1914,13 +1933,17 @@ edits it, it is the TOML file; if the app appends to it at runtime, it is SQLite
 TOML is awkward for deeply nested structures; the workspace schema must stay
 reasonably flat.
 
-### 5.3 Transport security *(new 2026-11)*
+### 5.3 Transport security *(new 2026-11, revised after spike)*
 
 **Decision.** TLS uses rustls with the operating system trust store (the sqlx
 rustls-with-native-roots feature, and `rustls-platform-verifier` where a
 non-sqlx path needs it). Connection settings expose the standard modes
 (`disable`, `prefer`, `require`, `verify-ca`, `verify-full`), a custom CA file,
-and client certificates.
+and client certificates. *(Spike, 2026-11.)* `tls-rustls-ring-native-roots`
+builds; `require` works on both databases and fails clearly against a server
+without TLS. Verification against native roots or a real CA bundle is
+**not yet tested** (the spike only had a self-signed certificate); this must
+be verified before the verify modes ship.
 
 SSH tunneling is a **post-MVP** feature. When built it uses `russh` (pure Rust,
 tokio-native, pre-1.0 so pinned) to open a local forwarded port that sqlx
@@ -2215,6 +2238,10 @@ discovering a grid or editor limit after the UI is built.
 - **OPEN-8 (Dependency sourcing for the UI).** Decided (2026-11): crates.io with
   exact pins, scheduled upgrades, escape hatches in 0.1.
 - **OPEN-9 (UI de-risking).** Decided (2026-11): week-one spike gate (Part 10).
+- **Keyring store wiring and the Linux fallback.** Decided by the spike
+  (2026-11): `keyring-core` + `zbus-secret-service-keyring-store`
+  (`rt-tokio-crypto-rust`), blocking calls on `spawn_blocking`, prompt-per-session
+  fallback on `PlatformFailure` / `NoStorageAccess` (5.1).
 
 ### OPEN-6 detail: multi-cursor plan (revised 2026-11)
 
@@ -2245,8 +2272,8 @@ fallback paths (a wrapped or custom editor element) remain available.
 - Default keymap preset (9.4): recommendation DBeaver-like.
 - Documentation strategy is being defined separately and, once agreed, becomes
   its own standard (and likely a Constitution pillar).
-- Exact keyring store wiring and the Linux no-Secret-Service fallback (5.1),
-  resolved by the spike.
+- Part 10 items 1-5 (grid, editor, input, startup, Dock) need a graphical
+  session and are still pending.
 
 ---
 
