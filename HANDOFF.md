@@ -4,7 +4,7 @@
 - Workspace skeleton: `dbased-commands`, `dbased-core`, `dbased-ui`, `dbased-app` (binary `dbased`); fmt, clippy, build pass. `etcetera` and the `keyring-core` stores are in the manifest.
 - Dev compose (`compose.yaml`, `.env`, `dev/seed/`, `dev/README.md`): Postgres 17 and MySQL 8.4 with seeded data incl. a 1M-row table.
 - Week-one spike (items 1-8) and the 2026-11 human tests on X11/MATE folded into `docs/PROJECT.md` (Part 10, 6.1, 7.1). Spike code lives outside the repo in `../dbased-spike`. Gate passed for starting the real UI.
-- Recorded as Later (not next): VS Code-like default keymap (9.4), smart multi-cursor (9.4.1), step-by-step debug mode (9.5), SQL formatting with portable styles (9.6), explain visualization (9.7), own emoji/symbol picker (6.1).
+- Recorded as Later (not next): VS Code-like default keymap, VS Code Windows mapping confirmed (9.4), smart multi-cursor (9.4.1), step-by-step debug mode (9.5), SQL formatting with portable styles (9.6), explain visualization (9.7), own emoji/symbol picker (6.1).
 
 ## In progress
 - Nothing.
@@ -30,7 +30,6 @@
 - Upstream Ctrl+Alt+click (no drag) adds a cursor on Linux; MySQL 8.4 JSON output for `EXPLAIN ANALYZE`.
 
 ## Open questions (user)
-- Shortcut mapping on Linux: the requested one (Shift+Alt+Up/Down copies lines, Ctrl+Alt+Up/Down adds cursors, as VS Code on Windows/macOS) or real VS Code on Linux (Shift+Alt adds cursors, Ctrl+Shift+Alt copies lines)?
 - Rebind `Ctrl+.` from upstream code actions to DBased's emoji/symbol picker (proposed: yes)?
 - Names and contents of the 3-4 formatting presets (9.6).
 - Moving the scanner into a pure `dbased-sql` crate shared by `core` and `ui` when smart multi-cursor is built (9.4.1, 1.3)?

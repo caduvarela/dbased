@@ -81,8 +81,9 @@ reasoning kept, rather than deleted.
     emoji/symbol picker on `Ctrl+.` (6.1).
 - **2026-11 — Editor UX and Later features.** Sections marked
   **(revised 2026-11, editor UX)** or **(new 2026-11)**:
-  - The default keymap preset is VS Code-like, with desktop-grab notes and
-    the upstream gap list (9.4, OPEN-6).
+  - The default keymap preset is VS Code-like (VS Code Windows mapping on
+    every OS, confirmed), with desktop-grab notes and the upstream gap list
+    (9.4, OPEN-6).
   - Smart multi-cursor, syntax-aware, on by default; the scanner will move to
     a shared pure crate (9.4.1, 1.3, 2.7).
   - Fragment debugging grows into a step-by-step debug mode with a block
@@ -2397,7 +2398,9 @@ Linux uses Shift+Alt+Up/Down for *add cursor* and Ctrl+Shift+Alt+Up/Down for
 *copy line*, and upstream gpui-base binds Shift+Alt+Up/Down to add cursor on
 Linux too. DBased uses the table above on every OS (one muscle memory across
 machines), so on Linux it overrides the upstream Shift+Alt binding and adds
-Ctrl+Alt+Up/Down. Pending the product owner's confirmation (Still open).
+Ctrl+Alt+Up/Down. Confirmed by the product owner (2026-11): the VS Code
+Windows mapping is the default on every OS; Linux users who want VS Code's
+Linux bindings remap them.
 
 **Desktop grabs (measured on MATE / marco).** The window manager takes
 Alt+click and Alt+drag (`mouse-button-modifier` = Alt), so Alt+click never
@@ -2801,12 +2804,8 @@ fallback paths (a wrapped or custom editor element) remain available.
 
 ### Still open
 
-- Default keymap mapping (9.4): the default preset is VS Code-like (decided
-  2026-11). To confirm: keep the requested mapping on Linux too (Shift+Alt
-  copies lines, Ctrl+Alt adds cursors, as VS Code on Windows and macOS), or
-  follow VS Code on Linux (Shift+Alt adds cursors, Ctrl+Shift+Alt copies
-  lines). Also to confirm: `Ctrl+.` opens DBased's symbol picker instead of
-  upstream code actions (6.1).
+- `Ctrl+.` binding (6.1, 9.4): to confirm that it opens DBased's symbol
+  picker instead of upstream code actions.
 - Formatting presets (9.6): names and contents of the 3-4 bundled presets,
   chosen by the product owner when phase 2 is scheduled.
 - Documentation strategy is being defined separately and, once agreed, becomes
