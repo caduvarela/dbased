@@ -12,6 +12,7 @@ use dbased_core::{
     SessionLimits, StatementStatus, TableRef, UserSql,
 };
 use secrecy::SecretString;
+use sqlx::Connection as _;
 use support::{TestDatabase, run, run_with};
 use tokio_util::sync::CancellationToken;
 
@@ -819,4 +820,135 @@ async fn a_cancel_handle_after_close_is_a_harmless_no_op() {
     let result = run(&mut stranger, "SELECT pg_sleep(0.5), 1").await;
     assert_eq!(result.outcome.status, StatementStatus::Completed);
     assert!(id.0 > 0);
+}
+
+/// Runs a statement and reports when `Columns` and the `Outcome` arrived.
+async fn timed_run(
+    session: &mut Box<dyn Session>,
+    sql: &str,
+    token: CancellationToken,
+    cancel_on_columns: bool,
+) -> (Duration, Duration, dbased_core::StatementOutcome) {
+    let (sink, mut receiver) = RowSink::channel(8);
+    let started = std::time::Instant::now();
+    let watching = {
+        let token = token.clone();
+        async move {
+            let mut columns_at = None;
+            let mut outcome = None;
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    dbased_core::RowSinkMessage::Columns(_) => {
+                        assert!(columns_at.is_none(), "Columns exactly once");
+                        columns_at = Some(started.elapsed());
+                        if cancel_on_columns {
+                            token.cancel();
+                        }
+                    }
+                    dbased_core::RowSinkMessage::Row(_) => {
+                        assert!(columns_at.is_some(), "Columns before any Row");
+                    }
+                    dbased_core::RowSinkMessage::Outcome(found) => outcome = Some(found),
+                }
+            }
+            (columns_at, started.elapsed(), outcome)
+        }
+    };
+    let executing = session.execute(UserSql::new(sql), sink, token);
+    let (result, (columns_at, finished_at, streamed)) = tokio::join!(executing, watching);
+    let outcome = result.unwrap();
+    assert_eq!(streamed.as_ref(), Some(&outcome));
+    (columns_at.expect("Columns arrived"), finished_at, outcome)
+}
+
+#[tokio::test]
+async fn columns_arrive_before_a_slow_statement_finishes() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+
+    let (columns_at, finished_at, outcome) = timed_run(
+        &mut session,
+        "SELECT pg_sleep(2), 1 AS one",
+        CancellationToken::new(),
+        false,
+    )
+    .await;
+
+    assert!(columns_at < Duration::from_millis(1200), "{columns_at:?}");
+    assert!(finished_at >= Duration::from_secs(2), "{finished_at:?}");
+    assert_eq!(outcome.status, StatementStatus::Completed);
+    assert_eq!(outcome.rows_received, 1);
+}
+
+#[tokio::test]
+async fn a_cancel_after_the_early_columns_keeps_the_session() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+    run(&mut session, "CREATE TEMP TABLE kept (id int)").await;
+
+    let (columns_at, finished_at, outcome) = timed_run(
+        &mut session,
+        "SELECT pg_sleep(30), 1",
+        CancellationToken::new(),
+        true,
+    )
+    .await;
+
+    assert!(columns_at < Duration::from_secs(5));
+    assert!(finished_at < Duration::from_secs(10));
+    assert_eq!(outcome.status, StatementStatus::Cancelled);
+    assert_eq!(outcome.rows_received, 0);
+    assert_eq!(outcome.session, SessionHealth::Healthy);
+    let after = run(&mut session, "SELECT count(*) FROM kept").await;
+    assert_eq!(after.rows, vec![vec![Value::Int(0)]]);
+}
+
+#[tokio::test]
+async fn a_cancel_while_the_server_parses_behind_a_lock_keeps_the_session() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+    run(&mut session, "CREATE TABLE locked (id int)").await;
+
+    let options = sqlx::postgres::PgConnectOptions::new_without_pgpass()
+        .host("127.0.0.1")
+        .port(database.server.port)
+        .username("postgres")
+        .password(support::PASSWORD)
+        .database(&database.name)
+        .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+    let mut admin = sqlx::PgConnection::connect_with(&options).await.unwrap();
+    sqlx::raw_sql("BEGIN; LOCK TABLE locked IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut admin)
+        .await
+        .unwrap();
+
+    let token = CancellationToken::new();
+    cancel_after(&token, Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    let (_, _, outcome) = timed_run(&mut session, "SELECT * FROM locked", token, false).await;
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(outcome.status, StatementStatus::Cancelled);
+    assert_eq!(outcome.session, SessionHealth::Healthy);
+    sqlx::raw_sql("ROLLBACK").execute(&mut admin).await.unwrap();
+    let after = run(&mut session, "SELECT 1").await;
+    assert_eq!(after.outcome.status, StatementStatus::Completed);
+}
+
+#[tokio::test]
+async fn multi_statement_input_outside_and_inside_a_transaction_still_works() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+
+    let outside = run(&mut session, "SELECT 1 AS a; SELECT 2").await;
+    assert_eq!(outside.columns.len(), 1);
+    assert_eq!(outside.rows, vec![vec![Value::Int(1)]]);
+    assert!(outside.outcome.extra_statements_discarded);
+
+    run(&mut session, "BEGIN").await;
+    let inside = run(&mut session, "SELECT 1 AS a; SELECT 2").await;
+    assert_eq!(inside.outcome.status, StatementStatus::Completed);
+    assert_eq!(inside.outcome.session, SessionHealth::Healthy);
+    let next = run(&mut session, "SELECT 3").await;
+    assert_eq!(next.rows, vec![vec![Value::Int(3)]]);
 }
