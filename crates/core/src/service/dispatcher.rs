@@ -1,16 +1,21 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_channel::{Receiver, Sender};
 use dbased_commands::{
-    Command, ConnectionId, ConnectionSettings, ConnectionState, ConnectionSummary, Event,
-    MetadataItem, MetadataItemKind, MetadataNode, PasswordSource, PasswordUpdate, RequestId,
+    Command, ConnectionId, ConnectionSettings, ConnectionState, ConnectionSummary, DatabaseKind,
+    ErrorInfo, Event, ExecuteTarget, MetadataItem, MetadataItemKind, MetadataNode, PasswordSource,
+    PasswordUpdate, RequestId, ResultId, TabId,
 };
 use secrecy::SecretString;
+use tokio::sync::oneshot;
 use tokio::task::{JoinError, JoinSet};
+use tokio_util::sync::CancellationToken;
 
 use super::error_info::error_info;
+use super::results::ResultStore;
 use super::store::StoredConnection;
+use super::tab::{PendingExecute, TabHandle, TabMessage, dialect_of, spawn_tab};
 use super::{ConnectionStore, CoreDependencies, DriverConnector, SecretStore};
 use crate::{CoreError, Driver, TableRef};
 
@@ -19,13 +24,17 @@ struct ConnectionEntry {
     password_saved: bool,
     state: ConnectionState,
     driver: Option<Arc<dyn Driver>>,
+    // @NOTE: executes that arrived while the connection was down or connecting; each one holds
+    // its tab's running slot, so the tab already reports busy.
+    waiting_executes: Vec<PendingExecute>,
 }
 
 /// What a spawned task hands back to the dispatcher. Tasks that only emit their own terminal
 /// event return `Done`.
 enum Completion {
     Connected {
-        request: RequestId,
+        // @NOTE: `None` for the connect an execute starts on its own.
+        request: Option<RequestId>,
         id: ConnectionId,
         result: Result<Arc<dyn Driver>, CoreError>,
     },
@@ -43,6 +52,8 @@ pub(super) struct Dispatcher {
     connector: Arc<dyn DriverConnector>,
     events: Sender<Event>,
     connections: BTreeMap<ConnectionId, ConnectionEntry>,
+    tabs: HashMap<TabId, TabHandle>,
+    results: ResultStore,
     // @NOTE: set when the config file could not be read, so a save never overwrites it blindly.
     storage_blocked: Option<String>,
     tasks: JoinSet<Completion>,
@@ -57,6 +68,8 @@ impl Dispatcher {
             connector: dependencies.connector,
             events,
             connections: BTreeMap::new(),
+            tabs: HashMap::new(),
+            results: ResultStore::default(),
             storage_blocked: None,
             tasks: JoinSet::new(),
             shutting_down: false,
@@ -90,6 +103,7 @@ impl Dispatcher {
                             password_saved: connection.password_saved,
                             state: ConnectionState::Disconnected,
                             driver: None,
+                            waiting_executes: Vec::new(),
                         },
                     );
                 }
@@ -131,18 +145,25 @@ impl Dispatcher {
                 connection,
                 node,
             } => self.load_children(request, connection, node).await,
-            // @TODO: execution lands with tab actors (docs/PROJECT.md 11.5 step 4).
-            Command::Execute { request, .. } => {
-                let error = CoreError::NotImplemented("statement execution");
-                self.fail(request, &error).await;
+            Command::OpenTab { tab, connection } => self.open_tab(tab, connection).await,
+            Command::CloseTab { tab } => self.close_tab(tab).await,
+            Command::Execute {
+                request,
+                tab,
+                script,
+                target,
+            } => self.execute(request, tab, script, target).await,
+            Command::Cancel { tab, request } => {
+                if let Some(handle) = self.tabs.get(&tab) {
+                    handle.running.cancel(request);
+                }
             }
-            // @TODO: tab and result commands carry no request id; they are ignored until the
-            // tab actors exist.
-            Command::OpenTab { .. }
-            | Command::CloseTab { .. }
-            | Command::Cancel { .. }
-            | Command::FetchRows { .. }
-            | Command::ReleaseResult { .. } => {}
+            Command::FetchRows {
+                result,
+                start,
+                count,
+            } => self.fetch_rows(result, start, count).await,
+            Command::ReleaseResult { result } => self.results.release(result),
         }
     }
 
@@ -152,8 +173,16 @@ impl Dispatcher {
     }
 
     async fn fail(&self, request: RequestId, error: &CoreError) {
-        self.emit(Event::RequestFailed {
-            request,
+        self.fail_with(request, error_info(error)).await;
+    }
+
+    async fn fail_with(&self, request: RequestId, error: ErrorInfo) {
+        self.emit(Event::RequestFailed { request, error }).await;
+    }
+
+    /// Commands without a request id (`OpenTab`, `FetchRows`) report problems here.
+    async fn report(&self, error: &CoreError) {
+        self.emit(Event::Error {
             error: error_info(error),
         })
         .await;
@@ -262,6 +291,7 @@ impl Dispatcher {
                         password_saved,
                         state: ConnectionState::Disconnected,
                         driver: None,
+                        waiting_executes: Vec::new(),
                     },
                 );
             }
@@ -310,27 +340,217 @@ impl Dispatcher {
             self.fail(request, &error).await;
             return;
         }
-        let driver = self.connections.remove(&id).and_then(|entry| entry.driver);
+        let removed = self.connections.remove(&id);
+        let (driver, waiting) = match removed {
+            Some(entry) => (entry.driver, entry.waiting_executes),
+            None => (None, Vec::new()),
+        };
+        for pending in waiting {
+            self.fail(pending.request, &CoreError::UnknownConnection)
+                .await;
+        }
+        let closing_tabs = self.close_tabs_of(id);
         let secret_result = self.delete_secret(id).await;
         self.emit_connections_changed().await;
 
-        // @TODO: close the connection's tabs (TabClosed each) once tab actors exist.
         let close_reply = secret_result.is_ok().then_some(request);
-        match (driver, &secret_result) {
-            (Some(driver), _) => self.spawn_close(driver, close_reply),
-            (None, Ok(())) => self.emit(Event::RequestCompleted { request }).await,
-            (None, Err(_)) => {}
+        if driver.is_some() || !closing_tabs.is_empty() {
+            self.spawn_close(driver, close_reply, closing_tabs);
+        } else if secret_result.is_ok() {
+            self.emit(Event::RequestCompleted { request }).await;
         }
         if let Err(error) = secret_result {
             self.fail(request, &error).await;
         }
     }
 
-    fn spawn_close(&mut self, driver: Arc<dyn Driver>, request: Option<RequestId>) {
+    /// Waits for the tabs first: cancels use the pool, so it must outlive every session (11.2).
+    fn spawn_close(
+        &mut self,
+        driver: Option<Arc<dyn Driver>>,
+        request: Option<RequestId>,
+        tabs_released: Vec<oneshot::Receiver<()>>,
+    ) {
         self.tasks.spawn(async move {
-            driver.close().await;
+            futures_util::future::join_all(tabs_released).await;
+            if let Some(driver) = driver {
+                driver.close().await;
+            }
             Completion::Closed { request }
         });
+    }
+
+    /// Cancels what is running and asks every tab of the connection to close its session.
+    fn release_sessions(&self, connection: ConnectionId) -> Vec<oneshot::Receiver<()>> {
+        let mut released = Vec::new();
+        for handle in self
+            .tabs
+            .values()
+            .filter(|tab| tab.connection == connection)
+        {
+            handle.running.cancel_current();
+            let (done, acknowledged) = oneshot::channel();
+            if handle
+                .messages
+                .send(TabMessage::ReleaseSession { done })
+                .is_ok()
+            {
+                released.push(acknowledged);
+            }
+        }
+        released
+    }
+
+    fn close_tabs_of(&mut self, connection: ConnectionId) -> Vec<oneshot::Receiver<()>> {
+        let tab_ids: Vec<TabId> = self
+            .tabs
+            .iter()
+            .filter(|(_, handle)| handle.connection == connection)
+            .map(|(tab, _)| *tab)
+            .collect();
+        let handles: Vec<TabHandle> = tab_ids
+            .iter()
+            .filter_map(|tab| self.tabs.remove(tab))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| self.close_handle(handle))
+            .collect()
+    }
+
+    /// Cancels, asks the actor to close (it emits `TabClosed`) and keeps its task joined by the
+    /// dispatcher, so shutdown waits for it.
+    fn close_handle(&mut self, handle: TabHandle) -> oneshot::Receiver<()> {
+        handle.running.cancel_current();
+        let (done, acknowledged) = oneshot::channel();
+        handle.messages.send(TabMessage::Close { done }).ok();
+        let task = handle.task;
+        self.tasks.spawn(async move {
+            task.await.ok();
+            Completion::Done
+        });
+        acknowledged
+    }
+
+    async fn open_tab(&mut self, tab: TabId, connection: ConnectionId) {
+        if !self.connections.contains_key(&connection) {
+            self.report(&CoreError::UnknownConnection).await;
+            return;
+        }
+        if self.tabs.contains_key(&tab) {
+            self.report(&CoreError::Internal("the tab is already open".into()))
+                .await;
+            return;
+        }
+        let handle = spawn_tab(tab, connection, self.events.clone(), self.results.clone());
+        self.tabs.insert(tab, handle);
+    }
+
+    async fn close_tab(&mut self, tab: TabId) {
+        let Some(handle) = self.tabs.remove(&tab) else {
+            self.report(&CoreError::UnknownTab).await;
+            return;
+        };
+        let waiting = self
+            .connections
+            .get_mut(&handle.connection)
+            .map(|entry| take_waiting_of(entry, tab))
+            .unwrap_or_default();
+        for pending in waiting {
+            self.fail(pending.request, &CoreError::UnknownTab).await;
+        }
+        self.close_handle(handle);
+    }
+
+    async fn execute(
+        &mut self,
+        request: RequestId,
+        tab: TabId,
+        script: String,
+        target: ExecuteTarget,
+    ) {
+        let Some(handle) = self.tabs.get(&tab) else {
+            self.fail(request, &CoreError::UnknownTab).await;
+            return;
+        };
+        let token = CancellationToken::new();
+        if let Err(error) = handle.running.begin(request, token.clone()) {
+            self.fail(request, &error).await;
+            return;
+        }
+        let running = handle.running.clone();
+        let pending = PendingExecute {
+            request,
+            tab,
+            script,
+            target,
+            token,
+        };
+        let Some(entry) = self.connections.get_mut(&handle.connection) else {
+            running.finish();
+            self.fail(request, &CoreError::UnknownConnection).await;
+            return;
+        };
+        let connection = handle.connection;
+        let connected = match (&entry.driver, entry.state) {
+            (Some(driver), ConnectionState::Connected) => Some(driver.clone()),
+            _ => None,
+        };
+        let kind = entry.settings.kind;
+        let Some(driver) = connected else {
+            let must_connect = entry.state == ConnectionState::Disconnected;
+            entry.waiting_executes.push(pending);
+            if must_connect {
+                // @NOTE: the Connecting state is visible to the UI, so this is not hidden magic.
+                self.begin_connect(connection, None, PasswordSource::Saved)
+                    .await;
+            }
+            return;
+        };
+        self.forward(pending, driver, kind).await;
+    }
+
+    async fn forward(&self, pending: PendingExecute, driver: Arc<dyn Driver>, kind: DatabaseKind) {
+        let request = pending.request;
+        let Some(handle) = self.tabs.get(&pending.tab) else {
+            self.fail(request, &CoreError::UnknownTab).await;
+            return;
+        };
+        let message = TabMessage::Execute {
+            job: pending,
+            driver,
+            dialect: dialect_of(kind),
+        };
+        if handle.messages.send(message).is_err() {
+            handle.running.finish();
+            let error = CoreError::Internal("the tab stopped".into());
+            self.fail(request, &error).await;
+        }
+    }
+
+    async fn fail_waiting(&self, waiting: Vec<PendingExecute>, error: &ErrorInfo) {
+        for pending in waiting {
+            if let Some(handle) = self.tabs.get(&pending.tab) {
+                handle.running.finish();
+            }
+            self.fail_with(pending.request, error.clone()).await;
+        }
+    }
+
+    async fn fetch_rows(&self, result: ResultId, start: u64, count: u32) {
+        match self.results.window(result, start, count) {
+            Ok(Some(rows)) => {
+                self.emit(Event::RowsWindow {
+                    result,
+                    start,
+                    rows,
+                })
+                .await;
+            }
+            // @NOTE: released while the fetch was in flight; the UI no longer wants it.
+            Ok(None) => {}
+            Err(error) => self.report(&error).await,
+        }
     }
 
     fn test_connection(
@@ -373,6 +593,18 @@ impl Dispatcher {
             }
             ConnectionState::Disconnected => {}
         }
+        self.begin_connect(id, Some(request), password).await;
+    }
+
+    async fn begin_connect(
+        &mut self,
+        id: ConnectionId,
+        request: Option<RequestId>,
+        password: PasswordSource,
+    ) {
+        let Some(entry) = self.connections.get_mut(&id) else {
+            return;
+        };
         entry.state = ConnectionState::Connecting;
         let settings = entry.settings.clone();
         self.emit(Event::ConnectionStateChanged {
@@ -412,13 +644,13 @@ impl Dispatcher {
             return;
         };
         entry.state = ConnectionState::Disconnected;
-        // @TODO: release every tab session of this connection before closing the pool.
+        let released = self.release_sessions(id);
         self.emit(Event::ConnectionStateChanged {
             id,
             state: ConnectionState::Disconnected,
         })
         .await;
-        self.spawn_close(driver, Some(request));
+        self.spawn_close(Some(driver), Some(request), released);
     }
 
     async fn load_children(
@@ -476,32 +708,44 @@ impl Dispatcher {
 
     async fn finish_connect(
         &mut self,
-        request: RequestId,
+        request: Option<RequestId>,
         id: ConnectionId,
         result: Result<Arc<dyn Driver>, CoreError>,
     ) {
         let Some(entry) = self.connections.get_mut(&id) else {
-            // @NOTE: the connection was deleted while connecting.
+            // @NOTE: the connection was deleted while connecting; its waiting executes were
+            // already failed by the delete.
             if let Ok(driver) = result {
                 driver.close().await;
             }
-            self.fail(request, &CoreError::UnknownConnection).await;
+            if let Some(request) = request {
+                self.fail(request, &CoreError::UnknownConnection).await;
+            }
             return;
         };
+        let waiting = std::mem::take(&mut entry.waiting_executes);
+        let kind = entry.settings.kind;
         match result {
             Ok(driver) if self.shutting_down => {
                 entry.state = ConnectionState::Disconnected;
                 driver.close().await;
+                let error = error_info(&CoreError::Connection("the core is shutting down".into()));
+                self.fail_waiting(waiting, &error).await;
             }
             Ok(driver) => {
-                entry.driver = Some(driver);
+                entry.driver = Some(driver.clone());
                 entry.state = ConnectionState::Connected;
                 self.emit(Event::ConnectionStateChanged {
                     id,
                     state: ConnectionState::Connected,
                 })
                 .await;
-                self.emit(Event::RequestCompleted { request }).await;
+                if let Some(request) = request {
+                    self.emit(Event::RequestCompleted { request }).await;
+                }
+                for pending in waiting {
+                    self.forward(pending, driver.clone(), kind).await;
+                }
             }
             Err(error) => {
                 entry.state = ConnectionState::Disconnected;
@@ -510,18 +754,24 @@ impl Dispatcher {
                     state: ConnectionState::Disconnected,
                 })
                 .await;
-                self.fail(request, &error).await;
+                if let Some(request) = request {
+                    self.fail(request, &error).await;
+                }
+                self.fail_waiting(waiting, &error_info(&error)).await;
             }
         }
     }
 
-    /// Lets in-flight tasks finish, then closes every pool.
+    /// Closes every tab session first, then every pool (11.2).
     async fn shut_down(&mut self) {
         self.shutting_down = true;
+        let handles: Vec<TabHandle> = self.tabs.drain().map(|(_, handle)| handle).collect();
+        for handle in handles {
+            self.close_handle(handle);
+        }
         while let Some(joined) = self.tasks.join_next().await {
             self.complete(joined).await;
         }
-        // @TODO: close every tab session before the pools (sessions first, docs/PROJECT.md 11.2).
         let drivers: Vec<Arc<dyn Driver>> = self
             .connections
             .values_mut()
@@ -530,6 +780,14 @@ impl Dispatcher {
         let closing = drivers.iter().map(|driver| driver.close());
         futures_util::future::join_all(closing).await;
     }
+}
+
+fn take_waiting_of(entry: &mut ConnectionEntry, tab: TabId) -> Vec<PendingExecute> {
+    let (mine, others) = std::mem::take(&mut entry.waiting_executes)
+        .into_iter()
+        .partition(|pending| pending.tab == tab);
+    entry.waiting_executes = others;
+    mine
 }
 
 fn validate_settings(settings: &ConnectionSettings) -> Result<(), CoreError> {

@@ -1433,6 +1433,7 @@ dependencies = [
  "async-channel",
  "async-trait",
  "dbased-commands",
+ "dbased-sql",
  "etcetera",
  "futures-util",
  "secrecy",

@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 dbased-commands.workspace = true
+dbased-sql.workspace = true
 async-trait.workspace = true
 etcetera.workspace = true
 futures-util.workspace = true

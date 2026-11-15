@@ -1,15 +1,21 @@
 //! The Core service: turns `Command` values into driver calls and driver results into `Event`
-//! values (docs/PROJECT.md Part 11). This is the connections-and-metadata skeleton; tab actors,
-//! execution and result streaming land with the next step of 11.5.
+//! values (docs/PROJECT.md Part 11): connections, metadata, and per-tab execution with
+//! streamed, pageable results.
 
 mod connector;
 mod dispatcher;
 mod error_info;
+mod results;
 mod secrets;
 mod store;
+mod tab;
 
 #[cfg(test)]
+mod execution_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_session;
 
 use std::sync::Arc;
 
