@@ -73,6 +73,13 @@ impl Driver for MysqlDriver {
         let mut connection = MySqlConnection::connect_with(&options)
             .await
             .map_err(map_sqlx_error)?;
+        // @NOTE: sqlx always advertises the client capability IGNORE_SPACE, which makes the server
+        // add that flag to the session's `sql_mode`. A SQL client must run user SQL under the
+        // server's own mode, so the session is put back on the global one.
+        sqlx::raw_sql("SET SESSION sql_mode = @@GLOBAL.sql_mode")
+            .execute(&mut connection)
+            .await
+            .map_err(map_sqlx_error)?;
         let connection_id = sqlx::query_scalar::<_, u64>("SELECT CONNECTION_ID()")
             .fetch_one(&mut connection)
             .await

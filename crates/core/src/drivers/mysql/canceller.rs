@@ -69,17 +69,30 @@ impl MysqlCanceller {
     }
 }
 
+/// Both statements are static text and the id is a bound integer, so it never becomes SQL text.
+///
+/// @NOTE: `KILL QUERY ?` cannot be prepared through sqlx (the server describes its parameter with
+/// a column type sqlx rejects), so the id goes through a user variable and a server-side
+/// prepared `KILL`. The id is stored as a number and rendered by the server's own `CONCAT`.
+const STORE_ID_SQL: &str = "SET @dbased_kill_id = ?";
+const KILL_SQL: &str = "SET @dbased_kill = CONCAT('KILL QUERY ', @dbased_kill_id); \
+                        PREPARE dbased_kill FROM @dbased_kill; \
+                        EXECUTE dbased_kill; \
+                        DEALLOCATE PREPARE dbased_kill";
+
 /// `Ok(false)` means the server no longer knows that connection id.
 async fn run_cancel(
     connection: &mut MySqlConnection,
     connection_id: u64,
 ) -> Result<bool, CoreError> {
-    // @NOTE: `KILL` accepts a bound parameter, so the statement stays a static string and the
-    // id never becomes SQL text.
-    let query = sqlx::query("KILL QUERY ?")
-        .bind(connection_id)
-        .execute(connection);
-    match timeout(CANCEL_QUERY_TIMEOUT, query)
+    let killing = async {
+        sqlx::query(STORE_ID_SQL)
+            .bind(connection_id)
+            .execute(&mut *connection)
+            .await?;
+        sqlx::raw_sql(KILL_SQL).execute(&mut *connection).await
+    };
+    match timeout(CANCEL_QUERY_TIMEOUT, killing)
         .await
         .map_err(|_| CoreError::Timeout("sending the cancel"))?
     {

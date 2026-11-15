@@ -45,6 +45,7 @@ impl SessionSettings {
 /// statement started or was absorbed (docs/PROJECT.md 3.2).
 const CANCEL_RESEND_INTERVAL: Duration = Duration::from_millis(500);
 /// Bound for messages that must not block forever once the caller stopped listening.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const FINAL_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +103,10 @@ impl MysqlSession {
         }
         // @NOTE: after this no handle can send a cancel, so a reused backend id is never hit.
         self.cancel_handle.mark_released().await;
-        connection.close_hard().await.ok();
+        // @NOTE: closing a TLS stream waits for the peer, so a stuck server must not stall the
+        // caller; the socket is dropped when the timeout elapses.
+        let closing = connection.close_hard();
+        timeout(CLOSE_TIMEOUT, closing).await.ok();
     }
 
     async fn ensure_open(&mut self) -> Result<(), CoreError> {
