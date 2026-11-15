@@ -3325,24 +3325,17 @@ fallback paths (a wrapped or custom editor element) remain available.
 - Detaching a result tab to its own OS window (9.2, Later): whether the
   second-`Root`-window technique is acceptable is a product call, to be made
   when the feature is scheduled.
-- **Core service (Part 11), product calls.** The spec assumes the
-  recommendation in each case; a different answer changes only the named
-  handler.
-  - *Run in a disconnected tab:* connect automatically with the saved
-    password, showing "Connecting" (recommended, DBeaver-like), or fail with
-    "not connected" and make the user connect first.
-  - *Re-running in a tab:* replace the tab's unpinned result tabs and release
-    their buffers (recommended), or keep every result until closed by hand.
-  - *Memory across results:* the 2.3 caps apply per result, so several large
-    results can coexist. Recommended for the MVP: keep per-result caps and
-    show total result memory in the status bar; add a global budget only if
-    real use shows a need.
-  - *Run-all after a truncated statement:* continue with the next statement
-    (recommended; a cap is not an error) or stop.
-  - *Deleting a connection with open tabs:* ask, then close those tabs
-    (recommended), or refuse until the tabs are closed.
-  - *"Save password" in the connection form:* checked by default
-    (recommended; stored in the OS keychain, 5.1) or unchecked.
+- **Core service (Part 11), product calls: decided 2026-11** (all six follow
+  the recommendation):
+  - Running in a disconnected tab connects automatically with the saved
+    password, showing "Connecting".
+  - Re-running in a tab replaces its unpinned result tabs and releases their
+    buffers.
+  - Per-result caps stay; total result memory is shown in the status bar; a
+    global budget only if real use shows a need.
+  - Run-all continues after a truncated statement (a cap is not an error).
+  - Deleting a connection with open tabs asks, then closes those tabs.
+  - "Save password" is checked by default (OS keychain, 5.1).
 
 ---
 
