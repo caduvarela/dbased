@@ -8,10 +8,13 @@ use sqlx::postgres::types::Oid;
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Column as _, Connection as _, Executor as _, PgConnection, Row as _, Statement as _};
 use sqlx::{Either, TypeInfo as _};
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::errors::{QUERY_CANCELED, TRANSACTION_ABORTED, database_error_info, map_sqlx_error};
+use super::errors::{
+    QUERY_CANCELED, TRANSACTION_ABORTED, database_error_info, map_sqlx_error,
+    sqlstate_means_session_lost,
+};
 use super::sql::{assert_user_sql, looks_row_returning};
 use super::values::{convert_row, estimated_size};
 use super::{PostgresConfig, TypeNameCache};
@@ -37,38 +40,21 @@ impl SessionSettings {
     }
 }
 
+/// How often a cancel is re-sent while draining, in case the first one arrived before the
+/// statement started or was absorbed (docs/PROJECT.md 3.2).
+const CANCEL_RESEND_INTERVAL: Duration = Duration::from_millis(500);
+/// Bound for messages that must not block forever once the caller stopped listening.
+const FINAL_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+const TYPE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lifecycle {
     Open,
+    /// An operation is in flight. If a future is dropped mid-operation the state stays `Busy`,
+    /// which the next call reads as "protocol state unknown" and closes the session
+    /// (docs/PROJECT.md 3.2).
+    Busy,
     Closed(CloseReason),
-}
-
-/// Marks the session closed if the `execute` future is dropped mid-operation:
-/// the protocol state is then unknown (docs/PROJECT.md 3.2).
-struct PoisonGuard<'a> {
-    lifecycle: &'a mut Lifecycle,
-    armed: bool,
-}
-
-impl<'a> PoisonGuard<'a> {
-    fn arm(lifecycle: &'a mut Lifecycle) -> Self {
-        Self {
-            lifecycle,
-            armed: true,
-        }
-    }
-
-    fn disarm(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PoisonGuard<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            *self.lifecycle = Lifecycle::Closed(CloseReason::FutureDropped);
-        }
-    }
 }
 
 pub(super) struct PostgresSession {
@@ -102,29 +88,45 @@ impl PostgresSession {
     }
 
     /// Drops the physical connection once the session is no longer usable.
+    ///
+    /// @NOTE: a dropped `execute` future cannot cancel the backend by itself, so the cancel
+    /// happens on the next call or on `close()`. A session dropped without `close()` leaves the
+    /// abandoned statement running until the server notices the disconnect.
     async fn release_connection(&mut self, reason: CloseReason) {
-        if self.lifecycle == Lifecycle::Open {
+        if matches!(self.lifecycle, Lifecycle::Open | Lifecycle::Busy) {
             self.lifecycle = Lifecycle::Closed(reason);
         }
         let Some(connection) = self.connection.take() else {
             return;
         };
-        if reason == CloseReason::FutureDropped {
-            // @NOTE: the abandoned statement may still run; this is the last moment the
-            // connection is held, so a late cancel cannot hit a stranger.
+        if reason != CloseReason::ClosedByCaller {
+            // @NOTE: an abnormal close may leave a statement running; this is the last moment
+            // the connection is held, so a late cancel cannot hit a stranger.
             self.canceller.cancel(self.id).await.ok();
         }
         connection.close_hard().await.ok();
     }
 
     async fn ensure_open(&mut self) -> Result<(), CoreError> {
+        if self.lifecycle == Lifecycle::Busy {
+            self.lifecycle = Lifecycle::Closed(CloseReason::FutureDropped);
+        }
         match self.lifecycle {
             Lifecycle::Open if self.connection.is_some() => Ok(()),
-            Lifecycle::Open => Err(CoreError::SessionClosed(CloseReason::ConnectionError)),
+            Lifecycle::Open | Lifecycle::Busy => {
+                Err(CoreError::SessionClosed(CloseReason::ConnectionError))
+            }
             Lifecycle::Closed(reason) => {
                 self.release_connection(reason).await;
                 Err(CoreError::SessionClosed(reason))
             }
+        }
+    }
+
+    /// Ends an operation that finished without closing the session.
+    fn finish_operation(&mut self) {
+        if self.lifecycle == Lifecycle::Busy {
+            self.lifecycle = Lifecycle::Open;
         }
     }
 
@@ -153,30 +155,42 @@ impl Session for PostgresSession {
         token: CancellationToken,
     ) -> Result<StatementOutcome, CoreError> {
         self.ensure_open().await?;
+        if token.is_cancelled() {
+            // @NOTE: a cancel that fired before the first poll would otherwise be lost.
+            return Ok(cancelled_before_start(&sink).await);
+        }
+        self.lifecycle = Lifecycle::Busy;
         let Some(connection) = self.connection.as_mut() else {
+            self.lifecycle = Lifecycle::Closed(CloseReason::ConnectionError);
             return Err(CoreError::SessionClosed(CloseReason::ConnectionError));
         };
-        let guard = PoisonGuard::arm(&mut self.lifecycle);
         let context = RunContext {
             session_id: self.id,
             canceller: self.canceller.as_ref(),
             settings: &self.settings,
             type_names: &self.type_names,
             pool: &self.pool,
+            token: &token,
         };
-        let run = run_statement(&context, connection, &sql, &sink, &token).await;
-        guard.disarm();
+        let mut report = run_statement(&context, connection, &sql, &sink, &token).await;
 
-        let report = match run {
-            Ok(report) => report,
-            Err(error) => {
-                self.release_connection(CloseReason::ConnectionError).await;
-                return Err(error);
-            }
-        };
+        if let Some(error) = report.fatal.take() {
+            self.release_connection(CloseReason::ConnectionError).await;
+            report.session_failed = true;
+            let outcome = report.into_outcome(SessionHealth::Closed(CloseReason::ConnectionError));
+            send_best_effort(&sink, RowSinkMessage::Outcome(outcome)).await;
+            return Err(error);
+        }
         let health = if report.drain_timed_out {
             self.release_connection(CloseReason::DrainTimeout).await;
             SessionHealth::Closed(CloseReason::DrainTimeout)
+        } else if report.describe_timed_out {
+            // @NOTE: the describe future was dropped on the connection, so its state is unknown.
+            self.release_connection(CloseReason::FutureDropped).await;
+            SessionHealth::Closed(CloseReason::FutureDropped)
+        } else if report.server_error_means_session_lost() {
+            self.release_connection(CloseReason::ConnectionError).await;
+            SessionHealth::Closed(CloseReason::ConnectionError)
         } else if report.cancel.is_some() {
             self.probe().await
         } else if report.server_error_has_code(TRANSACTION_ABORTED) {
@@ -184,25 +198,49 @@ impl Session for PostgresSession {
         } else {
             SessionHealth::Healthy
         };
+        self.finish_operation();
         let outcome = report.into_outcome(health);
-        // @NOTE: a receiver that is gone already stopped listening; the outcome is returned anyway.
-        sink.send(RowSinkMessage::Outcome(outcome.clone()))
-            .await
-            .ok();
+        send_best_effort(&sink, RowSinkMessage::Outcome(outcome.clone())).await;
         Ok(outcome)
     }
 
     async fn health_check(&mut self) -> Result<SessionHealth, CoreError> {
+        if self.lifecycle == Lifecycle::Busy {
+            self.lifecycle = Lifecycle::Closed(CloseReason::FutureDropped);
+        }
         if let Lifecycle::Closed(reason) = self.lifecycle {
             self.release_connection(reason).await;
             return Ok(SessionHealth::Closed(reason));
         }
-        Ok(self.probe().await)
+        self.lifecycle = Lifecycle::Busy;
+        let health = self.probe().await;
+        self.finish_operation();
+        Ok(health)
     }
 
     async fn close(mut self: Box<Self>) {
         self.release_connection(CloseReason::ClosedByCaller).await;
     }
+}
+
+/// A cancelled token before the statement was sent: nothing runs, nothing is lost.
+async fn cancelled_before_start(sink: &RowSink) -> StatementOutcome {
+    let report = RunReport {
+        cancel: Some(CancelReason::User),
+        ..RunReport::default()
+    };
+    let outcome = report.into_outcome(SessionHealth::Healthy);
+    send_best_effort(sink, RowSinkMessage::Columns(Vec::new())).await;
+    send_best_effort(sink, RowSinkMessage::Outcome(outcome.clone())).await;
+    outcome
+}
+
+/// Delivers a message unless the consumer is gone or stuck; the caller never blocks forever.
+async fn send_best_effort(sink: &RowSink, message: RowSinkMessage) -> bool {
+    matches!(
+        timeout(FINAL_SEND_TIMEOUT, sink.send(message)).await,
+        Ok(Ok(()))
+    )
 }
 
 /// `SELECT 1`, retried once because a cancel that arrived late may be absorbed by it.
@@ -228,6 +266,7 @@ struct RunContext<'a> {
     settings: &'a SessionSettings,
     type_names: &'a TypeNameCache,
     pool: &'a PgPool,
+    token: &'a CancellationToken,
 }
 
 #[derive(Default)]
@@ -240,9 +279,19 @@ struct RunReport {
     server_error: Option<DatabaseErrorInfo>,
     extra_statements: bool,
     drain_timed_out: bool,
+    describe_timed_out: bool,
+    /// A failure of the session itself (not a server error); the session must close.
+    fatal: Option<CoreError>,
+    session_failed: bool,
 }
 
 impl RunReport {
+    fn server_error_means_session_lost(&self) -> bool {
+        self.server_error
+            .as_ref()
+            .is_some_and(|error| sqlstate_means_session_lost(&error.sqlstate))
+    }
+
     fn server_error_has_code(&self, sqlstate: &str) -> bool {
         self.server_error
             .as_ref()
@@ -256,6 +305,7 @@ impl RunReport {
                 StatementStatus::Cancelled
             }
             (None, Some(_)) => StatementStatus::Failed,
+            (None, None) if self.session_failed => StatementStatus::Failed,
             (None, None) => StatementStatus::Completed,
         };
         let partial = matches!(
@@ -284,19 +334,52 @@ impl RunReport {
 struct CancelState {
     reason: Option<CancelReason>,
     error: Option<String>,
+    delivered: bool,
     drain_deadline: Option<Instant>,
+    next_resend: Instant,
 }
 
 impl CancelState {
+    fn new() -> Self {
+        Self {
+            reason: None,
+            error: None,
+            delivered: false,
+            drain_deadline: None,
+            next_resend: Instant::now(),
+        }
+    }
+
     async fn request(&mut self, context: &RunContext<'_>, reason: CancelReason) {
         if self.reason.is_some() {
             return;
         }
         self.reason = Some(reason);
-        self.drain_deadline = Some(Instant::now() + context.settings.drain_timeout);
         // @NOTE: only called while the statement's connection is still held by this session.
-        if let Err(error) = context.canceller.cancel(context.session_id).await {
-            self.error = Some(error.to_string());
+        match context.canceller.cancel(context.session_id).await {
+            Ok(()) => self.delivered = true,
+            Err(error) => self.error = Some(error.to_string()),
+        }
+        // @NOTE: the drain clock starts after the cancel returns, so a slow cancel does not eat it.
+        let now = Instant::now();
+        self.drain_deadline = Some(now + context.settings.drain_timeout);
+        self.next_resend = now + CANCEL_RESEND_INTERVAL;
+    }
+
+    /// Re-sends the cancel while the statement is still draining.
+    async fn resend(&mut self, context: &RunContext<'_>) {
+        self.next_resend = Instant::now() + CANCEL_RESEND_INTERVAL;
+        let Some(deadline) = self.drain_deadline else {
+            return;
+        };
+        let sending = context.canceller.cancel(context.session_id);
+        match tokio::time::timeout_at(deadline, sending).await {
+            Ok(Ok(())) if !self.delivered => {
+                self.delivered = true;
+                self.error = None;
+            }
+            Ok(Err(error)) if !self.delivered => self.error = Some(error.to_string()),
+            _ => {}
         }
     }
 }
@@ -307,14 +390,11 @@ async fn run_statement(
     sql: &UserSql,
     sink: &RowSink,
     token: &CancellationToken,
-) -> Result<RunReport, CoreError> {
+) -> RunReport {
     let mut report = RunReport::default();
-    let mut cancel = CancelState {
-        reason: None,
-        error: None,
-        drain_deadline: None,
-    };
+    let mut cancel = CancelState::new();
     let mut columns_sent = false;
+    let mut pending_columns: Option<Vec<ColumnMeta>> = None;
     let mut bytes_buffered = 0usize;
     let mut results_seen = 0u32;
 
@@ -322,11 +402,15 @@ async fn run_statement(
         let mut stream = sqlx::raw_sql(assert_user_sql(sql)).fetch_many(&mut *connection);
         loop {
             let item = match cancel.drain_deadline {
-                Some(deadline) => match timeout_at(deadline, stream.next()).await {
-                    Ok(item) => item,
-                    Err(_) => {
+                Some(deadline) => tokio::select! {
+                    item = stream.next() => item,
+                    () = sleep_until(deadline) => {
                         report.drain_timed_out = true;
                         break;
+                    }
+                    () = sleep_until(cancel.next_resend) => {
+                        cancel.resend(context).await;
+                        continue;
                     }
                 },
                 None => tokio::select! {
@@ -345,7 +429,10 @@ async fn run_statement(
                     let info = database_error_info(error.as_ref());
                     report.server_error.get_or_insert(info);
                 }
-                Err(error) => return Err(map_sqlx_error(error)),
+                Err(error) => {
+                    report.fatal = Some(map_sqlx_error(error));
+                    break;
+                }
                 Ok(Either::Left(result)) => {
                     results_seen += 1;
                     if results_seen == 1 {
@@ -363,19 +450,25 @@ async fn run_statement(
                         continue;
                     }
                     if !columns_sent {
-                        let columns = column_metadata(context, &row).await;
-                        send_or_cancel(
-                            sink,
-                            RowSinkMessage::Columns(columns),
-                            token,
-                            &mut cancel,
-                            context,
-                        )
-                        .await;
+                        let columns = match pending_columns.take() {
+                            Some(columns) => columns,
+                            None => column_metadata(context, &row).await,
+                        };
+                        let message = RowSinkMessage::Columns(columns.clone());
+                        if !send_or_cancel(sink, message, token, &mut cancel, context).await {
+                            pending_columns = Some(columns);
+                            continue;
+                        }
                         columns_sent = true;
                         report.headers_known = true;
                     }
-                    let values = convert_row(&row)?;
+                    let values = match convert_row(&row) {
+                        Ok(values) => values,
+                        Err(error) => {
+                            report.fatal = Some(error);
+                            break;
+                        }
+                    };
                     let size = estimated_size(&values);
                     let limits = context.settings.limits;
                     if report.rows_received >= limits.max_rows {
@@ -386,16 +479,11 @@ async fn run_statement(
                         cancel.request(context, CancelReason::MemoryCap).await;
                         continue;
                     }
-                    report.rows_received += 1;
-                    bytes_buffered += size;
-                    send_or_cancel(
-                        sink,
-                        RowSinkMessage::Row(values),
-                        token,
-                        &mut cancel,
-                        context,
-                    )
-                    .await;
+                    let message = RowSinkMessage::Row(values);
+                    if send_or_cancel(sink, message, token, &mut cancel, context).await {
+                        report.rows_received += 1;
+                        bytes_buffered += size;
+                    }
                 }
             }
         }
@@ -403,40 +491,55 @@ async fn run_statement(
 
     report.cancel = cancel.reason;
     report.cancel_error = cancel.error;
-    if report.drain_timed_out {
-        return Ok(report);
-    }
     if !columns_sent {
-        let healthy = report.server_error.is_none() && report.cancel.is_none();
-        let columns = if healthy && looks_row_returning(sql.as_str()) {
-            describe_columns(context, connection, sql).await
-        } else {
-            Vec::new()
+        let usable = report.server_error.is_none()
+            && report.cancel.is_none()
+            && report.fatal.is_none()
+            && !report.drain_timed_out;
+        let columns = match pending_columns {
+            Some(columns) => columns,
+            None if usable && looks_row_returning(sql.as_str()) => {
+                match describe_columns(context, connection, sql).await {
+                    Some(columns) => columns,
+                    None => {
+                        report.describe_timed_out = true;
+                        Vec::new()
+                    }
+                }
+            }
+            None => Vec::new(),
         };
-        report.headers_known = !columns.is_empty();
-        sink.send(RowSinkMessage::Columns(columns)).await.ok();
+        let has_columns = !columns.is_empty();
+        let sent = send_best_effort(sink, RowSinkMessage::Columns(columns)).await;
+        report.headers_known = sent && has_columns;
     }
-    Ok(report)
+    report
 }
 
 /// Sends one message, but keeps honouring the token while the sink is full.
+/// Returns whether the message was actually delivered.
 async fn send_or_cancel(
     sink: &RowSink,
     message: RowSinkMessage,
     token: &CancellationToken,
     cancel: &mut CancelState,
     context: &RunContext<'_>,
-) {
+) -> bool {
     if cancel.reason.is_some() {
-        return;
+        return false;
     }
     tokio::select! {
         sent = sink.send(message) => {
             if sent.is_err() {
                 cancel.request(context, CancelReason::ConsumerGone).await;
+                return false;
             }
+            true
         }
-        () = token.cancelled() => cancel.request(context, CancelReason::User).await,
+        () = token.cancelled() => {
+            cancel.request(context, CancelReason::User).await;
+            false
+        }
     }
 }
 
@@ -463,31 +566,53 @@ async fn resolve_type_name(context: &RunContext<'_>, oid: u32) -> Option<String>
     if let Some(name) = context.type_names.get(oid) {
         return Some(name);
     }
-    let lookup = sqlx::query_scalar::<_, String>("SELECT format_type($1, NULL)")
-        .bind(Oid(oid))
-        .fetch_one(context.pool);
-    let name = timeout(Duration::from_secs(2), lookup).await.ok()?.ok()?;
+    let acquiring = timeout(TYPE_LOOKUP_TIMEOUT, context.pool.acquire());
+    let mut connection = tokio::select! {
+        acquired = acquiring => acquired.ok()?.ok()?,
+        () = context.token.cancelled() => return None,
+    };
+    let finished = {
+        let lookup = sqlx::query_scalar::<_, String>("SELECT format_type($1, NULL)")
+            .bind(Oid(oid))
+            .fetch_one(&mut *connection);
+        tokio::select! {
+            result = timeout(TYPE_LOOKUP_TIMEOUT, lookup) => result.ok(),
+            () = context.token.cancelled() => None,
+        }
+    };
+    let Some(result) = finished else {
+        // @NOTE: the lookup future was dropped mid-query, so this connection must not return to the pool.
+        connection.detach().close_hard().await.ok();
+        return None;
+    };
+    let name = result.ok()?;
     context.type_names.insert(oid, name.clone());
     Some(name)
 }
 
 /// Prepares (never executes) the statement to learn its headers; a failure just shows none.
+/// `None` means the prepare timed out and its future was dropped on the connection.
 async fn describe_columns(
     context: &RunContext<'_>,
     connection: &mut PgConnection,
     sql: &UserSql,
-) -> Vec<ColumnMeta> {
+) -> Option<Vec<ColumnMeta>> {
     let preparing = connection.prepare(sqlx::SqlSafeStr::into_sql_str(assert_user_sql(sql)));
-    let Ok(Ok(statement)) = timeout(context.settings.health_check_timeout, preparing).await else {
-        return Vec::new();
+    let Ok(prepared) = timeout(context.settings.health_check_timeout, preparing).await else {
+        return None;
     };
-    statement
-        .columns()
-        .iter()
-        .map(|column| ColumnMeta {
-            name: column.name().to_owned(),
-            type_name: column.type_info().name().to_owned(),
-            nullable: None,
-        })
-        .collect()
+    let Ok(statement) = prepared else {
+        return Some(Vec::new());
+    };
+    Some(
+        statement
+            .columns()
+            .iter()
+            .map(|column| ColumnMeta {
+                name: column.name().to_owned(),
+                type_name: column.type_info().name().to_owned(),
+                nullable: None,
+            })
+            .collect(),
+    )
 }

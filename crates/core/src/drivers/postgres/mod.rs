@@ -46,6 +46,7 @@ impl TypeNameCache {
     }
 }
 
+/// @NOTE: must never derive `Debug`; `PgConnectOptions` prints the password (guarded by a test).
 pub struct PostgresDriver {
     options: PgConnectOptions,
     pool: PgPool,
@@ -160,6 +161,24 @@ fn paginate(base_sql: &str, page: PageRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Compile-time guard: the macro fails to build if the type ever implements `Debug`.
+    trait AmbiguousIfDebug<A> {
+        fn probe() {}
+    }
+    impl<T: ?Sized> AmbiguousIfDebug<()> for T {}
+    impl<T: ?Sized + std::fmt::Debug> AmbiguousIfDebug<u8> for T {}
+    macro_rules! assert_not_debug {
+        ($type:ty) => {
+            let _ = <$type as AmbiguousIfDebug<_>>::probe;
+        };
+    }
+
+    #[test]
+    fn types_holding_connect_options_do_not_implement_debug() {
+        assert_not_debug!(PostgresDriver);
+        assert_not_debug!(PostgresCanceller);
+    }
 
     #[test]
     fn quotes_identifiers_and_doubles_embedded_quotes() {

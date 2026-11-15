@@ -10,8 +10,12 @@ use crate::{Canceller, CoreError, SessionId};
 
 const ONE_OFF_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CANCEL_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const ONE_OFF_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Cancels from a connection that is never a session's own (docs/PROJECT.md 3.2).
+///
+/// @NOTE: must never derive `Debug`; `PgConnectOptions` prints the password.
+// @TODO: decide the canceller API shape (per-session handle vs. id lookup) with a product call.
 pub(super) struct PostgresCanceller {
     pool: PgPool,
     options: PgConnectOptions,
@@ -34,10 +38,13 @@ impl PostgresCanceller {
         };
         match run_cancel(&mut connection, backend_pid).await {
             Ok(cancelled) => Ok(cancelled),
-            Err(error) => {
+            Err(pool_error) => {
                 // @NOTE: a pool connection that ended abnormally is never returned to the pool.
                 connection.detach().close_hard().await.ok();
-                Err(error)
+                // A broken pooled connection must not decide the outcome: retry on a fresh one.
+                self.cancel_through_one_off_connection(backend_pid)
+                    .await
+                    .map_err(|_| pool_error)
             }
         }
     }
@@ -49,7 +56,9 @@ impl PostgresCanceller {
             .map_err(|_| CoreError::Timeout("opening a cancel connection"))?
             .map_err(map_sqlx_error)?;
         let result = run_cancel(&mut connection, backend_pid).await;
-        connection.close().await.ok();
+        timeout(ONE_OFF_CLOSE_TIMEOUT, connection.close())
+            .await
+            .ok();
         result
     }
 }
