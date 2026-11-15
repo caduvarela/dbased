@@ -17,3 +17,13 @@ pub enum Value {
     Json(String),
     Unknown(String),
 }
+
+/// Column metadata; travels once per result, ahead of the rows (docs/PROJECT.md 2.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnMeta {
+    pub name: String,
+    /// The database's own type name, as reported with the result.
+    pub type_name: String,
+    /// `None` when the protocol does not tell (text-protocol results do not).
+    pub nullable: Option<bool>,
+}
