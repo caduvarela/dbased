@@ -9,7 +9,7 @@ mod token;
 
 pub use params::{Parameter, find_parameters};
 pub use scanner::{Scanner, tokenize};
-pub use split::{Statement, split_statements};
+pub use split::{Statement, split_statements, statement_at};
 pub use token::{Dialect, ParameterKind, Span, Token, TokenKind};
 
 #[cfg(test)]

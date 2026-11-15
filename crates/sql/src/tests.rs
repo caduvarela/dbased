@@ -500,3 +500,54 @@ fn round_trip_on_pseudo_random_fragments() {
         }
     }
 }
+
+fn statement_text_at(source: &str, cursor: usize) -> Option<&str> {
+    let statements = split_statements(source, Postgres);
+    statement_at(&statements, cursor).map(|statement| statement.text(source))
+}
+
+#[test]
+fn statement_at_picks_the_statement_containing_the_cursor() {
+    let source = "select 1; select 2;\nselect 3";
+    assert_eq!(statement_text_at(source, 0), Some("select 1"));
+    assert_eq!(statement_text_at(source, 4), Some("select 1"));
+    assert_eq!(statement_text_at(source, 12), Some("select 2"));
+    assert_eq!(statement_text_at(source, source.len()), Some("select 3"));
+}
+
+#[test]
+fn statement_at_prefers_the_statement_before_a_cursor_in_a_gap_or_on_a_terminator() {
+    let source = "select 1;\n\n  select 2";
+    // On the terminator and right after it.
+    assert_eq!(statement_text_at(source, 8), Some("select 1"));
+    assert_eq!(statement_text_at(source, 9), Some("select 1"));
+    // In the blank gap between the statements.
+    assert_eq!(statement_text_at(source, 10), Some("select 1"));
+    assert_eq!(statement_text_at(source, 11), Some("select 1"));
+    // At the first character of the next one.
+    assert_eq!(statement_text_at(source, 13), Some("select 2"));
+}
+
+#[test]
+fn statement_at_falls_back_to_the_first_statement_after_the_cursor() {
+    let source = "   \n\n  select 1;";
+    assert_eq!(statement_text_at(source, 0), Some("select 1"));
+    assert_eq!(statement_text_at(source, 3), Some("select 1"));
+}
+
+#[test]
+fn statement_at_is_none_without_statements() {
+    assert_eq!(statement_text_at("", 0), None);
+    assert_eq!(statement_text_at("-- only a comment\n;", 3), None);
+}
+
+#[test]
+fn statement_at_keeps_compound_bodies_whole() {
+    let source =
+        "create function f() returns int as $$ begin; select 1; end $$ language sql; select 2";
+    let inside = source.find("select 1").unwrap_or(0);
+    assert_eq!(
+        statement_text_at(source, inside),
+        Some("create function f() returns int as $$ begin; select 1; end $$ language sql")
+    );
+}

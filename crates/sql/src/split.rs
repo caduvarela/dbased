@@ -56,6 +56,17 @@ pub fn split_statements(source: &str, dialect: Dialect) -> Vec<Statement> {
     statements
 }
 
+/// The statement a cursor belongs to: the last one that starts at or before the cursor (so a
+/// cursor inside it, on its terminator or in the gap after it all pick it), else the first one
+/// after the cursor. `None` only when there are no statements.
+pub fn statement_at(statements: &[Statement], cursor: usize) -> Option<&Statement> {
+    let starting_before = statements
+        .iter()
+        .rev()
+        .find(|statement| statement.span.start <= cursor);
+    starting_before.or_else(|| statements.first())
+}
+
 struct Current {
     start: Option<usize>,
     end: usize,
