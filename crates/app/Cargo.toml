@@ -10,10 +10,15 @@ name = "dbased"
 path = "src/main.rs"
 
 [dependencies]
+dbased-commands.workspace = true
 dbased-core.workspace = true
 dbased-ui.workspace = true
 
 tokio.workspace = true
+
+[features]
+# @NOTE: serves FakeCore instead of the real Core, for manual UI work; never in release builds.
+fake-core = ["dbased-commands/fake"]
 
 [lints]
 workspace = true

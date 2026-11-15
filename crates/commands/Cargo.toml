@@ -9,5 +9,11 @@ publish.workspace = true
 async-channel.workspace = true
 secrecy.workspace = true
 
+# @NOTE: the fake splits scripts with the same splitter the real Core uses.
+dbased-sql = { workspace = true, optional = true }
+
+[features]
+fake = ["dep:dbased-sql"]
+
 [lints]
 workspace = true

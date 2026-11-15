@@ -1,47 +1,56 @@
 //! The only crate allowed to use GPUI. Talks to the core exclusively via `dbased-commands`.
 
-use gpui::{AppContext, IntoElement, ParentElement, Styled, TitlebarOptions, WindowOptions};
-use gpui_component::Root;
+mod actions;
+mod client;
+mod editor_panel;
+mod explorer_panel;
+mod grid;
+mod results_panel;
+mod state;
+mod workspace;
 
-pub fn run() {
-    gpui_platform::application().run(|app| {
-        gpui_component::init(app);
-        app.spawn(async move |app| {
-            let open_result = app.update(|app| {
-                let options = WindowOptions {
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("DBased".into()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                };
-                app.open_window(options, |window, app| {
-                    let view = app.new(|_| EmptyView);
-                    app.new(|app| Root::new(view, window, app))
-                })
-            });
-            if let Err(error) = open_result {
-                eprintln!("failed to open window: {error}");
-            }
-        })
-        .detach();
-    });
+#[cfg(test)]
+mod tests;
+
+use dbased_commands::UiLink;
+use gpui::{AppContext as _, TitlebarOptions, WindowOptions};
+use gpui_component::Root;
+use gpui_kit_assets::Assets;
+
+use workspace::Workspace;
+
+/// Registers what the UI needs at app level: components, key bindings.
+fn init(cx: &mut gpui::App) {
+    gpui_component::init(cx);
+    actions::bind_keys(cx);
 }
 
-struct EmptyView;
-
-impl gpui::Render for EmptyView {
-    fn render(
-        &mut self,
-        _window: &mut gpui::Window,
-        _app: &mut gpui::Context<Self>,
-    ) -> impl IntoElement {
-        // @TODO: replace with the real workspace shell.
-        gpui::div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child("DBased")
-    }
+/// Opens the main window on `link` and runs until it closes.
+pub fn run(link: UiLink) {
+    gpui_platform::application()
+        .with_assets(Assets)
+        .run(move |cx| {
+            init(cx);
+            cx.on_window_closed(|cx, _window| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            let options = WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some("DBased".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let opened = cx.open_window(options, |window, cx| {
+                let view = cx.new(|cx| Workspace::new(link, window, cx));
+                cx.new(|cx| Root::new(view, window, cx))
+            });
+            if let Err(error) = opened {
+                eprintln!("failed to open window: {error}");
+                cx.quit();
+            }
+        });
 }
