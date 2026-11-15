@@ -10,6 +10,7 @@
 - Nothing.
 
 ## Next step
+- `dbased-sql` crate done (cbd22cd..1649306): scanner, statement splitter, parameter finder; not wired into core yet. Wire the splitter into the Core execution path (9.2) so multi-statement strings never reach `raw_sql`, then `rewrite_parameters`.
 - Postgres driver slice is done and reviewed (commits up to a709f08). Decisions taken (3.2.4): drain-not-cancel inside user transactions; cancel handle tied to a live session. Both implemented (6d66a6f, 0c672dd); 33 integration tests.
 - First real driver (Postgres): the 2.1 trait (Session / Canceller, `UserSql`, `health_check`), the `AssertSqlSafe` invariant in the `UserSql` conversion (1.2, rule 1), the 3.2 cancel policy with integration tests (clean cancel, late cancel, aborted transaction, drain timeout).
 - In parallel or next: real UI shell in `crates/ui` (Dock with explorer / editor / bottom result tabs, grid against a fake Core source) following the 6.3 grid rules; the editor takes focus on open and tab activation (6.1). Add `tree-sitter-sql` and `gpui-base =0.9.1` to `ui` only when first used.
