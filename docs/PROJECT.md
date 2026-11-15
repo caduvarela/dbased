@@ -1215,7 +1215,7 @@ provides its own way to drive it. Serves Performance and Maintainability.
 Core API is async end to end, so synchronous test code must spin up a runtime.
 Acceptable.
 
-### 1.2 Database access crate *(revised 2026-11)*
+### 1.2 Database access crate *(revised 2026-11, spike)*
 
 **Decision.** Use `sqlx` 0.9 (MSRV 1.94) with the runtime query API, **not** the
 `query!` compile-time macros. Features: `runtime-tokio`, an explicit rustls
@@ -1236,15 +1236,22 @@ running arbitrary SQL:
    that conversion function and is short and version-independent (why user SQL
    is executed as-is, and that SQL we assemble ourselves must never pass
    through it).
-2. **Ad-hoc scripts use `raw_sql`** (simple query protocol: multiple statements,
-   results per statement, everything returned in text format, which pairs
-   naturally with the `Value::Unknown` fallback). Statement-level work that
-   needs binary types uses the extended protocol with `persistent(false)` /
-   statement cache disabled, so cached plans never go stale after DDL.
+2. **Ad-hoc SQL uses `raw_sql`, one statement per call** (text protocol on
+   both databases, so every value arrives as the server renders it, see 2.5).
+   Scripts are split by our tokenizer and sent statement by statement (9.2),
+   read with `fetch_many` (rows, then one `QueryResult` boundary). `sqlx::query`
+   is never used for unparameterized user SQL: on MySQL it still uses the
+   binary protocol, which turns zero-dates into NULL-lookalikes, and it rejects
+   multi-statement text. Parameterized statements (9.3) use the extended
+   protocol with `persistent(false)` / statement cache disabled, so cached
+   plans never go stale after DDL.
 3. **Never use `sqlx::Any`.** Its decoding is lossy (decimal, uuid, enums,
-   chrono). Use `PgPool` / `MySqlPool` concretely behind the `Driver` trait and
-   decode through `Row::try_get_raw` plus `type_info().name()`, falling back to
-   raw text or bytes for unmodeled types.
+   chrono). Use `PgPool` / `MySqlPool` concretely behind the `Driver` trait.
+   Raw cell access in 0.9 (`ValueRef::as_bytes()` is private) is
+   `try_get_unchecked::<Option<String>, _>` for Postgres text-format values and
+   `try_get_unchecked::<Option<&[u8]>, _>` for MySQL and binary-format values,
+   with `type_info().name()` choosing the `Value` variant (2.5). Typed
+   `try_get::<String>` is not an option: it rejects non-text types.
 4. **Never drop a sqlx future or stream to stop work** (it does not stop the
    server, see 3.2). Editor sessions never enter the pool (2.2), and a pool
    connection whose work was cancelled is closed, never returned (3.2).
@@ -1341,7 +1348,7 @@ replaces.
 
 This is the heart of the application and where the Constitution was thinnest.
 
-### 2.1 The Driver trait *(revised 2026-11)*
+### 2.1 The Driver trait *(revised 2026-11, spike)*
 
 **Decision.** One trait abstracts the database. The Query Engine talks only to
 this trait. Dialect differences live behind it, not in `match` expressions.
@@ -1451,16 +1458,26 @@ visible (No Magic). Table-browse pagination (2.4) re-queries per portion on the
 pool, an extra round trip per page versus a held cursor; cheap, and it frees
 connections.
 
-### 2.3 Result loading: ad-hoc queries
+### 2.3 Result loading: ad-hoc queries *(revised 2026-11, spike)*
 
 **Decision.** Running arbitrary SQL streams rows from `sqlx` into a **bounded**
 in-memory buffer inside the Core, then frees the session. The UI paginates
 against that Core buffer. The buffer has **two caps, whichever is reached first**:
 a maximum row count and a maximum memory budget. Both are **user-configurable**
 (defaults: 200,000 rows / 512 MB, treated as starting points to tune). When
-either cap is reached, the Core stops fetching, marks the result `truncated`,
-and tells the UI to suggest refining the query or exporting (export streams to
-disk without buffering, see 3.3).
+either cap is reached, the Core stops buffering, cancels the statement and
+drains the session (3.2; simply dropping the stream would let the server keep
+producing and stall the next run), marks the result `truncated`, and tells the
+UI to suggest refining the query or exporting (export streams to disk without
+buffering, see 3.3). sqlx's stream does not buffer client side (memory stayed
+flat over 2M rows), so the caps are the only buffer.
+
+Column headers come from the first row. A statement that returns no rows
+carries no column metadata through `raw_sql`, so when the statement looks
+row-returning the Core describes it (prepare only, nothing executes) to show
+headers; a describe failure just shows no headers. The row
+count shown is the rows received; `rows_affected` is shown only for
+statements without rows (Postgres reports it for `SELECT`, MySQL reports 0).
 
 ```
 ad-hoc SQL → sqlx stream → Core bounded buffer → session free
@@ -1512,7 +1529,7 @@ philosophy. Serves Performance and UX.
 **Trade-off.** Two code paths (ad-hoc vs browse) and a slower fallback for
 keyless tables. Both are deliberate and bounded.
 
-### 2.5 The Value model *(revised 2026-11)*
+### 2.5 The Value model *(revised 2026-11, spike)*
 
 **Decision.** Decode every cell into one common enum. Anything we do not model
 explicitly falls back to the database's text representation.
@@ -1526,7 +1543,7 @@ pub enum Value {
     Decimal(String),   // exact; never f64
     Text(String),
     Bytes(Vec<u8>),    // shown as hex / size in grid
-    Timestamp(String), // ISO 8601, tz-aware where available
+    Timestamp(String), // as rendered by the server (DateStyle, session tz)
     Date(String),
     Time(String),
     Uuid(String),
@@ -1538,12 +1555,26 @@ pub enum Value {
 Column metadata (name, declared type, nullability) travels **once** per result.
 Rows travel as arrays of `Value`, not as objects, to avoid repeating keys.
 
-Decoding is per driver, through `try_get_raw` and the driver's type name (1.2,
-rule 3). The early test matrix must cover: Postgres `NUMERIC`, `TIMESTAMPTZ`,
-`INTERVAL`, ranges, arrays (including arrays of enums), custom enums, `JSONB`,
-`BYTEA`; MySQL unsigned integers, `BIT`, `DECIMAL`, zero-dates, `JSON`.
-Arrays, ranges and composite types render through `Unknown` (text form) in the
-MVP.
+Decoding is per driver, from the raw cell plus the driver's type name (1.2,
+rule 3). Ad-hoc results use the text protocol, verified faithful in the
+spike: Postgres renders every tested type exactly (numeric, timestamptz,
+interval, ranges, arrays, enums, composites, jsonb, uuid, inet, money, xml,
+geometric, infinity; `bytea` as `\x` hex), and MySQL renders everything
+except `BIT`, `GEOMETRY`, `BLOB` / `VARBINARY`, which arrive as raw bytes and
+become `Bytes` (hex in the grid; `BIT` also as a bit string). Mapping text to
+a typed variant is an optimization: a text that does not fit its variant (for
+example `BIGINT UNSIGNED` above `i64::MAX`) falls back to `Unknown`, never
+to an error or a rounded value. The Core never rewrites user SQL to fix a
+type (no injected `ST_AsText`); table browse, whose SQL we build, may.
+
+Known quirks: Postgres simple mode reports enum, composite and xml type names
+as `?`, so the Core resolves unknown type OIDs through a cached `pg_type`
+lookup on the pool; MySQL `SET` columns report `CHAR`. Session settings
+(`DateStyle`, `bytea_output`, `lc_monetary`) shape Postgres text; DBased shows
+what the server rendered and does not normalize it. The binary protocol
+(parameterized statements only) needs per-type decoders for numeric,
+interval, range, array and composite, strips the jsonb version byte, and must
+render MySQL zero-dates faithfully rather than as NULL.
 
 **Why.** A SQL client must never silently corrupt data. `Decimal` and money
 types as strings prevent float rounding. `Unknown` guarantees we always render
@@ -1989,7 +2020,7 @@ places; the single declaration in item 2 prevents drift.
 Each item is tagged **MVP** or **Later** to respect "build only what the milestone
 requires" and avoid scope creep.
 
-### 9.1 Tab and session model (MVP) *(revised 2026-11)*
+### 9.1 Tab and session model (MVP) *(revised 2026-11, spike)*
 
 **Decision.** Each editor tab is bound to exactly one connection (Constitution:
 tabs belong to connections) and owns a **dedicated session** (2.2), so session
@@ -2016,10 +2047,22 @@ pinnable and detachable (detach and float via the Dock). MVP ships run-current
 and run-all into sequential result tabs; DBeaver's "execute each statement in a
 separate tab, in parallel" is Later.
 
+*(Revised 2026-11, spike.)* Run-all sends the split statements **one at a
+time** on the tab's session, stopping at the first error (the error is tied
+to its statement), rather than one multi-statement `raw_sql` call. A
+multi-statement call ends at the first error too, but it reports results only
+as a flat stream, gives no headers for empty results, and a cancel or row cap
+on one statement would abort every statement after it. One statement per
+call keeps each result, error, cap and DDL-invalidation signal (4.2) attached
+to its statement, matching psql and DBeaver semantics (each statement
+autocommits on its own).
+
 **Why.** DBeaver-parity for the core editing loop, without taking on parallel
 execution complexity in v1. Serves UX and Simplicity.
 
 **Trade-off.** Multiple result sets add result-area complexity; phased in.
+Run-all now depends on the splitter being right (compound bodies, `DELIMITER`,
+2.7), and costs one round trip per statement, negligible interactively.
 
 ### 9.3 Query parameters (Later, near-term) *(revised 2026-11)*
 
@@ -2033,7 +2076,14 @@ parameter). Values are passed as **real bound parameters** (sqlx bind), never
 interpolated into SQL, and the Core rewrites `:name` / `?` into the driver's
 native placeholders (`$1..$n` for Postgres, `?` for MySQL) through the Driver
 trait. Param values reuse the Value model (2.5). Statements with parameters run
-on the extended protocol (not `raw_sql`).
+on the extended protocol (not `raw_sql`), so their results take the binary
+decoding path and its quirks (2.5).
+
+*(Spike, 2026-11.)* Rules confirmed or added: `?` is a jsonb operator on
+Postgres (`?`, `?|`, `?&`), so anonymous `?` stays opt-in and off by default
+there; `:name` is a parameter only when the name directly follows a single
+colon (not `::`) and the colon is not inside `[...]` (Postgres array slices
+`a[1:n]`); a native `$1` typed by the user is left untouched.
 
 **Why.** Safety (no injection), correct typing, and DBeaver-parity. Serves UX First
 and Hidden Power.
