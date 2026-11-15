@@ -83,6 +83,8 @@ reasoning kept, rather than deleted.
   **(revised 2026-11, editor UX)** or **(new 2026-11)**:
   - The default keymap preset is VS Code-like, with desktop-grab notes and
     the upstream gap list (9.4, OPEN-6).
+  - Smart multi-cursor, syntax-aware, on by default; the scanner will move to
+    a shared pure crate (9.4.1, 1.3, 2.7).
 
 ---
 
@@ -1354,7 +1356,10 @@ dbased/
 `app` depends on `ui` and `core`. Dependency direction: `app → ui → commands`
 and `app → core → commands`, so nothing points away from the Core toward the
 UI. Drivers stay as modules inside `core` until a concrete architectural need
-(for example a plugin system) justifies splitting them.
+(for example a plugin system) justifies splitting them. *(Revised 2026-11,
+editor UX.)* One such split is planned: the SQL scanner (2.7) moves into a
+pure `dbased-sql` crate, used by `core` and `ui`, when the first synchronous
+editor feature needs it (9.4.1).
 
 Workspace-wide enforcement (in the root manifest): `unsafe` code is forbidden,
 clippy denies `unwrap_used` and `expect_used`, `[workspace.dependencies]`
@@ -1668,7 +1673,8 @@ keep destructive operations honest.
 
 ### 2.7 SQL text handling: tokenizer plus parser *(new 2026-11, revised after spike)*
 
-**Decision.** SQL text is processed in two layers, both inside `core`:
+**Decision.** SQL text is processed in two layers, both inside `core` (the
+scanner later moves to a pure `dbased-sql` crate shared with `ui`, 1.3, 9.4.1):
 
 1. **An in-house tokenizer** (small, dialect-aware for Postgres and MySQL)
    that never fails on broken SQL. It understands line and block comments
@@ -2419,6 +2425,51 @@ default differs from VS Code on Linux and from the editor's upstream Linux
 bindings, so it must be documented in the keymap help. Several commands wait on
 upstream API.
 
+#### 9.4.1 Smart multi-cursor (Later, on by default) *(new 2026-11)*
+
+**Decision.** Add cursor above / below (Ctrl+Alt+Up/Down) is context-aware by
+default, through DBased's own `SmartAddCursorAbove` / `SmartAddCursorBelow`
+actions. A setting `smart_multicursor` (default `true`) turns it off, which
+routes the binding back to the upstream actions. The base algorithm is a port
+of the VS Code extension Smart Multi Cursor (`idanpa/vscode-smartmulticursor`,
+MIT, Copyright (c) 2022 Idan Pazi; about 100 lines):
+
+1. Take the last cursor (the first one for "above") and look at the
+   character just before or just after it, allowing one adjacent space.
+2. If that is a trigger, and **every** existing selection stands in the same
+   relation to the same trigger, put the new cursor on the next (previous)
+   line at the same Nth occurrence of that trigger plus the same offset.
+3. Otherwise fall back to plain column insertion (visible columns, tab size,
+   full-width characters). No next line means nothing happens.
+
+The extension's triggers are the characters `" ' = : , ; . ( ) { } [ ] < > |`
+and Tab, matched by a regex, with no notion of strings or comments. DBased
+changes two things. **Triggers are SQL tokens** from the in-house scanner
+(2.7): `,`, `(`, `)`, `=` and the other comparison operators, `::`, `.`, `;`,
+string and quoted-identifier boundaries, and the keyword `AS`. **Context is
+syntax-aware**: a comma inside a string literal or a comment is not a trigger.
+The scan covers only the enclosing statement, so it stays bounded. Offsets are
+counted in characters per line (the extension counts UTF-16 columns) and
+converted to the editor's UTF-8 offsets at the boundary.
+
+The scanner lives in `core`, which `ui` must not depend on (1.3), and a cursor
+action cannot wait on a Command round trip. When this is built, the scanner
+moves into a small pure crate (`dbased-sql`: no I/O, no async, no GPUI) used
+by both `core` and `ui`, so there is still exactly one lexer (2.7). It also
+needs the upstream selection getter and line helpers (OPEN-6). If code is
+ported rather than reimplemented, the file keeps the original MIT copyright
+notice and the project's third-party notices list it.
+
+**Why.** Column-shaped SQL (`INSERT ... VALUES` rows, column lists, `CASE`
+branches, aligned `=` in `SET`) has lines of different lengths, where plain
+column insertion lands in the wrong place. Following the structure instead
+makes multi-cursor edits work on real SQL. Serves UX and Hidden Power.
+
+**Trade-off.** A new cursor that does not always go straight down is less
+literal than the upstream action (tension with No Magic, Part 8); the rule is
+simple, the fallback is the plain behavior, and the setting turns it off. A
+new crate, justified by the dependency rule rather than by size.
+
 ### 9.5 Nested-query fragment debugging (Later)
 
 **Decision (future).** Allow executing a fragment of a query in isolation: a
@@ -2675,6 +2726,9 @@ philosophy are named out loud rather than hidden.
   drain, health check, sessions outside the pool, cancelled pool connections
   closed. The cost is a policy we must test ourselves; `tokio-postgres` stays
   the prepared escape hatch.
+- **Smart multi-cursor on by default vs No Magic.** 9.4.1 places a new cursor
+  by structure, not straight down. Bounded by one simple, documented rule, a
+  plain fallback, and a setting that turns it off.
 - **Session preservation vs simplicity of recovery.** 3.2 keeps a session
   after a clean cancel instead of always reconnecting, to preserve the user's
   temp tables and settings. Closing is reserved for unknown protocol state.
