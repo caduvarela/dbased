@@ -1840,14 +1840,14 @@ Recorded after the first Postgres slice and an independent review:
 - **Unsupported for now:** COPY via `raw_sql` (closes the session), session
   idle timeout and reconnect, connect timeouts, parameterized/extended
   protocol, `list_routines`.
-- **Open decision, Core-initiated cancel inside a user transaction:** a row
-  cap or a gone consumer cancels the statement and aborts the user's
-  `BEGIN` block. Proposed: inside a transaction, drain and discard instead of
-  cancelling. Needs transaction-state tracking (sqlx hides ReadyForQuery
-  status).
-- **Open decision, canceller API:** `Driver::canceller()` can cancel any
-  `SessionId`, including after the session closed (PID reuse). Proposed: a
-  cancel handle tied to a live session.
+- **Decided (2026-11), Core-initiated cancel inside a user transaction:** a
+  row cap or a gone consumer must not abort the user's `BEGIN` block. While a
+  transaction is open the driver drains and discards the remaining rows
+  instead of cancelling. An explicit user cancel still cancels. Requires
+  reliable transaction-state tracking (sqlx hides the ReadyForQuery status).
+- **Decided (2026-11), canceller API:** cancellation goes through a handle tied
+  to a live session, never a bare `SessionId`, so a cancel can only reach the
+  backend while the Core still holds that connection (no PID-reuse hazard).
 
 ### 3.3 Export *(revised 2026-11)*
 
