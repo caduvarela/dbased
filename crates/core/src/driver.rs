@@ -1,46 +1,45 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use dbased_commands::{ConnectionConfig, Value};
+use dbased_commands::{ColumnMeta, Value};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-use crate::CoreError;
+use crate::{CoreError, DatabaseErrorInfo, UserSql};
 
-/// Backend-side identifier of a session (e.g. a PID), used to cancel running queries.
+/// Backend identifier captured when a session opens (`pg_backend_pid()` /
+/// `CONNECTION_ID()`), used by cancellation (docs/PROJECT.md 2.1, 3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId(pub u64);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionId(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SchemaInfo {
+pub struct Schema {
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableInfo {
+pub struct TableRef {
     pub schema: String,
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ViewInfo {
+pub struct ViewRef {
     pub schema: String,
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoutineInfo {
+pub struct Routine {
     pub schema: String,
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ColumnInfo {
+pub struct Column {
     pub name: String,
     pub data_type: String,
     pub nullable: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct QueryResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,24 +48,163 @@ pub struct PageRequest {
     pub offset: u64,
 }
 
+/// The two result caps of docs/PROJECT.md 2.3; whichever is reached first wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionLimits {
+    pub max_rows: u64,
+    pub max_bytes: usize,
+}
+
+impl Default for SessionLimits {
+    fn default() -> Self {
+        Self {
+            max_rows: 200_000,
+            max_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+/// Why the Core asked the server to stop a statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    User,
+    RowCap,
+    MemoryCap,
+    /// The receiving end of the sink went away.
+    ConsumerGone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    ClosedByCaller,
+    /// The statement did not reach its terminal result within the drain timeout.
+    DrainTimeout,
+    HealthCheckFailed,
+    ConnectionError,
+    /// An `execute` future was dropped mid-operation, so protocol state is unknown.
+    FutureDropped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionHealth {
+    Healthy,
+    /// SQLSTATE 25P02: alive, but the user's transaction needs a ROLLBACK.
+    TransactionAborted,
+    /// The session was closed; the next run needs a fresh one.
+    Closed(CloseReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementStatus {
+    Completed,
+    /// The server reported an error and the Core did not cancel.
+    Failed,
+    /// The Core issued a cancel for the user. The server outcome is in
+    /// `server_error`: `None` means the server reported success and the
+    /// statement may have taken effect.
+    Cancelled,
+    /// A row or memory cap stopped the statement (2.3).
+    Truncated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementOutcome {
+    pub status: StatementStatus,
+    pub rows_received: u64,
+    /// Only for statements that return no rows (2.3).
+    pub rows_affected: Option<u64>,
+    /// Rows received so far are kept but the result is incomplete.
+    pub partial: bool,
+    pub server_error: Option<DatabaseErrorInfo>,
+    /// Set when the side-connection cancel itself failed (3.2: reported, not swallowed).
+    pub cancel_error: Option<String>,
+    /// The call carried more than one statement; only the first one's rows were
+    /// streamed. Callers must split scripts first (1.2 rule 2).
+    pub extra_statements_discarded: bool,
+    pub session: SessionHealth,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowSinkMessage {
+    /// Always first, exactly once (empty for statements without columns).
+    Columns(Vec<ColumnMeta>),
+    Row(Vec<Value>),
+    /// Always last; also returned by `Session::execute`.
+    Outcome(StatementOutcome),
+}
+
+/// Bounded channel the driver streams a result into; a full channel slows the read.
+#[derive(Debug, Clone)]
+pub struct RowSink {
+    sender: mpsc::Sender<RowSinkMessage>,
+}
+
+impl RowSink {
+    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<RowSinkMessage>) {
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        (Self { sender }, receiver)
+    }
+
+    /// Fails only when the receiver is gone.
+    pub async fn send(&self, message: RowSinkMessage) -> Result<(), CoreError> {
+        self.sender
+            .send(message)
+            .await
+            .map_err(|_| CoreError::Connection("the result receiver was dropped".to_owned()))
+    }
+}
+
 #[async_trait]
 pub trait Driver: Send + Sync {
-    async fn connect(config: &ConnectionConfig) -> Result<Self, CoreError>
-    where
-        Self: Sized;
+    /// Opens a dedicated session (one physical connection, outside the pool) (2.2).
+    async fn open_session(&self) -> Result<Box<dyn Session>, CoreError>;
 
-    async fn execute_query(&self, sql: &str) -> Result<QueryResult, CoreError>;
-    async fn session_id(&self) -> Result<SessionId, CoreError>;
-    async fn cancel_query(&self, session: &SessionId) -> Result<(), CoreError>;
+    /// Cancels from a separate connection, for any session of this driver (3.2).
+    fn canceller(&self) -> Arc<dyn Canceller>;
 
-    async fn list_schemas(&self) -> Result<Vec<SchemaInfo>, CoreError>;
-    async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>, CoreError>;
-    async fn list_columns(&self, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, CoreError>;
-    async fn list_views(&self, schema: &str) -> Result<Vec<ViewInfo>, CoreError>;
-    async fn list_routines(&self, schema: &str) -> Result<Vec<RoutineInfo>, CoreError>;
+    async fn list_schemas(&self) -> Result<Vec<Schema>, CoreError>;
+    async fn list_tables(&self, schema: &str) -> Result<Vec<TableRef>, CoreError>;
+    async fn list_columns(&self, table: &TableRef) -> Result<Vec<Column>, CoreError>;
+    async fn list_views(&self, schema: &str) -> Result<Vec<ViewRef>, CoreError>;
+    async fn list_routines(&self, schema: &str) -> Result<Vec<Routine>, CoreError>;
 
-    /// Quotes an identifier using the dialect's rules.
     fn quote_identifier(&self, identifier: &str) -> String;
-    /// Wraps a query so only the requested page is returned.
-    fn paginate(&self, sql: &str, page: PageRequest) -> String;
+    fn paginate(&self, base_sql: &str, page: PageRequest) -> String;
+    // @TODO: `rewrite_parameters` (2.1) arrives with the tokenizer and parameters (2.7, 9.3).
+}
+
+/// Free constructor kept off `Driver` so `dyn Driver` stays usable.
+#[async_trait]
+pub trait DriverFactory {
+    type Config: Send;
+
+    async fn connect(config: Self::Config) -> Result<Box<dyn Driver>, CoreError>;
+}
+
+#[async_trait]
+pub trait Session: Send {
+    fn session_id(&self) -> SessionId;
+
+    /// Runs ONE statement and streams its rows into the sink. On cancel it
+    /// drains to the terminal result; it never returns with the statement
+    /// still in flight (3.2). Server errors come back in the outcome; `Err` is
+    /// for failures of the session itself.
+    async fn execute(
+        &mut self,
+        sql: UserSql,
+        sink: RowSink,
+        token: CancellationToken,
+    ) -> Result<StatementOutcome, CoreError>;
+
+    /// Cheap liveness probe (`SELECT 1`) used after a cancel (3.2).
+    async fn health_check(&mut self) -> Result<SessionHealth, CoreError>;
+
+    /// Closes the physical connection.
+    async fn close(self: Box<Self>);
+}
+
+#[async_trait]
+pub trait Canceller: Send + Sync {
+    /// Issues a cancel from a SEPARATE connection (3.2).
+    async fn cancel(&self, session: SessionId) -> Result<(), CoreError>;
 }
