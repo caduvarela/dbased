@@ -4,6 +4,8 @@
 - Workspace skeleton: `dbased-commands`, `dbased-core`, `dbased-ui`, `dbased-app` (binary `dbased`); fmt, clippy, build pass.
 - Week-one spike items 6-8 (tokenizer, keyring, driver gotchas) done and folded into `docs/PROJECT.md` (revision log, 2026-11 spike entry). Key changes: keep a session after a clean cancel (3.2), sessions outside the pool (2.2), one statement per `raw_sql` call over the text protocol (2.3, 2.5, 9.2), in-house scanner as the only lexer (2.7), keyring wiring decided for Linux (5.1).
 
+- Dev compose (`compose.yaml`, `.env`, `dev/seed/`, `dev/README.md`): Postgres 17 and MySQL 8.4 with seeded data incl. a 1M-row table; verified up/down.
+
 ## In progress
 - Nothing.
 
