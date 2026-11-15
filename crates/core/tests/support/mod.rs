@@ -1,6 +1,8 @@
 //! Test support: one Postgres container per test binary, one database per test.
 //! The image comes from the repo-root `.env` so versions never drift (docs/PROJECT.md Part 7).
 
+// @NOTE: each test binary uses a different part of this shared module.
+#![allow(dead_code)]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};

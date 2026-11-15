@@ -1430,6 +1430,7 @@ dependencies = [
 name = "dbased-core"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "async-trait",
  "dbased-commands",
  "etcetera",
