@@ -49,9 +49,6 @@ pub struct PageRequest {
     pub offset: u64,
 }
 
-// @NOTE: sqlx 0.9 only accepts `&'static str` or `sqlx::AssertSqlSafe(..)` as query text.
-// A SQL client executes user-typed SQL by design, so implementations wrap it with
-// `AssertSqlSafe`. Never use it for SQL built from untrusted fragments we assemble ourselves.
 #[async_trait]
 pub trait Driver: Send + Sync {
     async fn connect(config: &ConnectionConfig) -> Result<Self, CoreError>

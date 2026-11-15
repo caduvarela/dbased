@@ -9,7 +9,7 @@
 
 ## Next step
 - Spike items 1-5 (grid, editor, IME/Wayland, startup, Dock) in a graphical session.
-- First real driver (Postgres): apply the 2.1 trait (Session / Canceller, `UserSql`, `health_check`), replace the provisional `AssertSqlSafe` `@NOTE` in `crates/core/src/driver.rs`, and implement the 3.2 cancel policy with integration tests for: clean cancel, late cancel, aborted transaction, drain timeout.
+- First real driver (Postgres): apply the 2.1 trait (Session / Canceller, `UserSql`, `health_check`), put the `AssertSqlSafe` invariant in the `UserSql` conversion function (1.2, rule 1), and implement the 3.2 cancel policy with integration tests for: clean cancel, late cancel, aborted transaction, drain timeout.
 
 ## Re-verify before relying on it
 - Dropped-future and cancel behavior on the extended protocol / `prepare` / sqlx `begin()` (spike covered simple-protocol queries only).
