@@ -22,8 +22,8 @@ Branch topology (each line is "based on"):
 
 ## In progress when this was written (agents may have finished: check `git log` on each branch)
 - `fix/execution-review`: 8 findings from the review of `feat/core-execution`: script continuing on a fresh session after a mid-script close (data-integrity risk), cancel during auto-connect, panics in spawned tasks leaving tabs stuck, Connect terminal event during shutdown, empty-script validation before connecting, aborted-statement result completeness, ReleaseResult before create, TabId reuse guard.
-- `feat/csv-export`: Core-only CSV export (3.3), no UI yet.
-- `feat/mysql-driver`: MySQL driver mirroring the Postgres one (KILL QUERY cancel, transaction tracking).
+- `feat/csv-export`: DONE, pushed. Core-only CSV export (3.3), no UI yet. Rows end with LF (RFC 4180 says CRLF: one constant in the encoder).
+- `feat/mysql-driver`: DONE, pushed (34 integration tests). Open decision: enable sqlx `mysql-rsa` so TLS Disable/Prefer-plaintext works with `caching_sha2_password` (pulls in the `rsa` crate). Not yet wired into `DefaultConnector`; branch is based on old `ad515c0`, merge into the integration branch.
 
 ## Next steps (suggested order)
 1. Finish and merge the three in-progress branches into `feat/app-wiring` (or a successor integration branch). Merge `fix/execution-review` first.
