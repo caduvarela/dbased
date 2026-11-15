@@ -143,3 +143,31 @@ pub enum ExecutionStatus {
     Cancelled { statement: u32 },
     Aborted { statement: u32, error: ErrorInfo },
 }
+
+/// How an export writes its file (docs/PROJECT.md 3.3). The default is comma, header, no BOM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CsvOptions {
+    /// One ASCII character other than a quote or a line break.
+    pub delimiter: char,
+    pub header: bool,
+    /// A UTF-8 byte order mark, for spreadsheets that need it to detect the encoding.
+    pub bom: bool,
+}
+
+impl Default for CsvOptions {
+    fn default() -> Self {
+        Self {
+            delimiter: ',',
+            header: true,
+            bom: false,
+        }
+    }
+}
+
+/// How an export that did not fail ended. Failures end with `RequestFailed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportStatus {
+    Completed,
+    /// Stopped on request; the partial file was removed.
+    Cancelled,
+}

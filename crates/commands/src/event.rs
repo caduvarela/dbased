@@ -1,7 +1,7 @@
 use crate::{
     ColumnMeta, ConnectionId, ConnectionState, ConnectionSummary, ErrorInfo, ExecutionStatus,
-    MetadataItem, MetadataNode, RequestId, ResultId, ResultOutcome, SessionState, StatementSpan,
-    TabId, Value,
+    ExportStatus, MetadataItem, MetadataNode, RequestId, ResultId, ResultOutcome, SessionState,
+    StatementSpan, TabId, Value,
 };
 
 /// Notifications the Core sends back to the UI.
@@ -65,6 +65,19 @@ pub enum Event {
         connection: ConnectionId,
         node: MetadataNode,
         items: Vec<MetadataItem>,
+    },
+    /// Dropped when the event channel is full; `ExportFinished` carries the final counts.
+    ExportProgress {
+        request: RequestId,
+        rows_written: u64,
+        bytes_written: u64,
+    },
+    /// Terminal event of an export that did not fail.
+    ExportFinished {
+        request: RequestId,
+        status: ExportStatus,
+        rows_written: u64,
+        bytes_written: u64,
     },
     /// Not tied to a request (startup, config file).
     Error {

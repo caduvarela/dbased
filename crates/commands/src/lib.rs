@@ -12,9 +12,10 @@ mod value;
 pub use bridge::{CoreLink, UiLink, bridge};
 pub use command::Command;
 pub use dto::{
-    ConnectionSettings, ConnectionState, ConnectionSummary, DatabaseKind, ExecuteTarget,
-    ExecutionStatus, MetadataItem, MetadataItemKind, MetadataNode, PasswordSource, PasswordUpdate,
-    ResultOutcome, ResultStatus, SessionResetReason, SessionState, StatementSpan, TlsMode,
+    ConnectionSettings, ConnectionState, ConnectionSummary, CsvOptions, DatabaseKind,
+    ExecuteTarget, ExecutionStatus, ExportStatus, MetadataItem, MetadataItemKind, MetadataNode,
+    PasswordSource, PasswordUpdate, ResultOutcome, ResultStatus, SessionResetReason, SessionState,
+    StatementSpan, TlsMode,
 };
 pub use error::{DatabaseError, ErrorInfo, ErrorKind};
 pub use event::Event;

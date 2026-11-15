@@ -1,6 +1,8 @@
+use std::path::PathBuf;
+
 use crate::{
-    ConnectionId, ConnectionSettings, ExecuteTarget, MetadataNode, PasswordSource, PasswordUpdate,
-    RequestId, ResultId, TabId,
+    ConnectionId, ConnectionSettings, CsvOptions, ExecuteTarget, MetadataNode, PasswordSource,
+    PasswordUpdate, RequestId, ResultId, TabId,
 };
 
 /// Requests the UI sends to the Core. No `PartialEq`: secrets cannot be compared.
@@ -56,6 +58,19 @@ pub enum Command {
     },
     ReleaseResult {
         result: ResultId,
+    },
+    /// Streams a fresh run of ONE statement to `path` (docs/PROJECT.md 3.3). The terminal event
+    /// is `ExportFinished` or `RequestFailed`.
+    ExportCsv {
+        request: RequestId,
+        connection: ConnectionId,
+        sql: String,
+        path: PathBuf,
+        options: CsvOptions,
+    },
+    /// `request` is the `ExportCsv` request to stop; a no-op when it is not running.
+    CancelExport {
+        request: RequestId,
     },
     LoadChildren {
         request: RequestId,
