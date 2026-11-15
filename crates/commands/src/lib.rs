@@ -9,6 +9,9 @@ mod event;
 mod ids;
 mod value;
 
+#[cfg(feature = "fake")]
+pub mod fake;
+
 pub use bridge::{CoreLink, UiLink, bridge};
 pub use command::Command;
 pub use dto::{
