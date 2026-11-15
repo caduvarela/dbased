@@ -60,6 +60,17 @@ reasoning kept, rather than deleted.
   - The in-house scanner is the only lexer; `sqlparser`'s tokenizer is a test
     oracle (2.7).
   - Keyring wiring decided for Linux; TLS verify modes still to verify (5.1, 5.3).
+- **2026-11 — Week-one spike, items 1-5 (GUI)** (X11, AMD GPU,
+  gpui-component 0.9.1). Sections marked **(revised 2026-11, spike)**:
+  - The Table virtualizes rows and is kept; grid frame-budget rules, loading
+    cells, and Core-driven export and sort (6.3, 3.3).
+  - Editor used as provided; `tree-sitter-sql` feature and a direct
+    `gpui-base` pin in `ui` only; large-file warning; memory is a watch item
+    (0.1, 0.4, 6.1).
+  - Dock: no Tiles, floating or detach. Result tabs stay in the bottom dock;
+    detached windows are Later (0.4, 9.2). Layout persists as an opaque JSON
+    file per workspace (5.2).
+  - Gate passed for starting the real UI, with scheduled checks left (Part 10).
 
 ---
 
@@ -1114,7 +1125,7 @@ snapshot from October 2025 and must not be mixed in. Therefore:
   recorded in the workspace manifest;
 - upgrades are deliberate and scheduled (roughly monthly, or when a needed fix
   lands), never automatic, and happen on their own branch;
-- *(spike, 2026-11)* the UI also needs two things the default set lacks:
+- *(Spike, 2026-11.)* The UI also needs two things the default set lacks:
   gpui-component's `tree-sitter-sql` feature (SQL highlighting) and a direct
   `gpui-base` dependency (the Dock lives there, and the `AddCursorAbove` /
   `AddCursorBelow` actions are not re-exported by `gpui_component::input`).
@@ -2339,7 +2350,7 @@ loop is solid.
 
 ---
 
-## Part 10 — Week-One Spike *(new 2026-11)*
+## Part 10 — Week-One Spike *(new 2026-11, revised 2026-11, spike)*
 
 **Decision.** Before the real UI is built, a time-boxed spike validates the
 riskiest assumptions of the GPUI bet and of the new SQL handling. It is a gate:
@@ -2352,12 +2363,33 @@ Checks:
 1. **Grid scale.** Scroll a table backed by 5,000,000 logical rows through
    windowed fetches from a fake Core source. Measure scroll smoothness, memory,
    and window-fetch latency. Pass: smooth scrolling and flat memory.
+   **DONE (2026-11, X11, AMD GPU, gpui-component 0.9.1).** Rows are virtual;
+   RSS 109 to 138 MB over 5M rows (200-row windows, 4,800-row cache). Quiet
+   machine: steady 16.7 ms frames (p95 ~16.8) at 2k-500k rows/s, fetch latency
+   up to 50 ms; under CPU contention 33 ms. The grid costs 8-11 ms CPU per
+   frame, hence the budget rules in 6.3.
 2. **Editor.** Open a 100,000-line SQL file; exercise highlighting, find,
    multi-cursor (Alt-click, add-cursor above/below, `add_selection`), soft wrap.
+   **DONE (2026-11).** First render 165 ms (next frame 295 ms), insert at line
+   50,000 7.7 ms avg (p95 8.3), jump to end 17 ms; RSS 127 MB after open,
+   ~295-385 MB after edits (watch item, 6.1). Alt-click and `add_selection`
+   (select-all-occurrences) work. Needs `tree-sitter-sql` and `gpui-base` (0.1).
 3. **Input quality.** IME composition with CJK input, dead keys, and clipboard
    behavior; behavior on Wayland and X11 for Linux, then macOS and Windows.
+   **PARTIAL (2026-11).** No preedit/commit callbacks exist, so this is a
+   manual checklist only (6.1). gpui picks Wayland if `WAYLAND_DISPLAY` is set,
+   else X11 if `DISPLAY` is set (`XDG_SESSION_TYPE` is ignored). Pending: the
+   checklist (CJK via fcitx5/ibus, dead keys, emoji, large multi-line paste,
+   undo/redo) run by a person on X11 and Wayland.
 4. **Startup.** Cold start to first interactive window. Budget: under 1 second.
+   **DONE (2026-11, warm caches).** Median 136 ms (126-153, 10 runs) from
+   process start to first rendered frame, release build, empty window.
+   Re-measure cold (dropped caches) and once the real UI exists.
 5. **Dock.** Layout save and restore round-trip; detach/float of a result panel.
+   **DONE (2026-11).** `DockArea::dump` / `load` round-trips structure, sizes
+   and per-panel state. No Tiles, floating or detach in 0.9.1 (left, right,
+   bottom, center only); a second-window workaround exists. Result: 0.4, 5.2,
+   6.3, 9.2.
 6. **Tokenizer groundwork.** Behavior of `sqlparser`'s tokenizer on `:name`, `?`,
    dollar quotes and `::`; decide how much the in-house tokenizer can reuse.
    **DONE (2026-11).** sqlparser 0.64 lexes clean text correctly (`::`, dollar
@@ -2379,6 +2411,16 @@ Checks:
    cancel and stall the next use; MySQL may return success after `KILL QUERY`.
    Result: keep-after-clean-cancel policy, sessions outside the pool, per-statement
    text-protocol execution (2.2, 2.3, 2.5, 3.2, 9.2). TLS verify modes untested (5.3).
+
+**Gate status (2026-11).** Passed for starting the real UI: no finding
+triggers an escape hatch (0.1), and every remaining check can only be fixed
+inside `ui` (upstream fix or contained workaround). Still pending, scheduled
+rather than blocking: item 3's manual checklist (before the editor milestone
+closes); a person's visual check of grid smoothness and row positions near the
+end of 5M rows, with wheel and scrollbar drag (all runs used programmatic
+scroll); items 1-5 on Wayland; and the grid on a lower-end CPU/GPU and under
+GPU contention (before the first release). A failure there that cannot be
+fixed in `ui` reopens this gate.
 
 **Why.** The documentation is a plan; these are the points where the plan could
 be wrong in ways that are expensive to discover later. Serves Engineering
@@ -2427,8 +2469,10 @@ Alt-click, `AddCursorAbove` / `AddCursorBelow` actions, and a public
 the programmatic equivalent of Alt-clicking another cursor.
 
 **Remaining work, in order:**
-1. Verify behavior in the spike (Part 10): edits across all cursors, undo
-   atomicity, painting, performance on large files.
+1. Verify behavior (Part 10). *Spike, 2026-11:* Alt-click and
+   `add_selection` work, including select-all-occurrences on a 100K-line file
+   (capped at 5,000 selections in the spike). Still to check by hand: undo
+   atomicity across cursors and multi-cursor painting.
 2. Build **select-next-occurrence** (Ctrl+D) and **select-all-occurrences**
    (Ctrl+Shift+L) in `ui` on top of `add_selection`, as keymap-layer actions
    (9.4), including skip-occurrence.
@@ -2445,8 +2489,11 @@ fallback paths (a wrapped or custom editor element) remain available.
 - Default keymap preset (9.4): recommendation DBeaver-like.
 - Documentation strategy is being defined separately and, once agreed, becomes
   its own standard (and likely a Constitution pillar).
-- Part 10 items 1-5 (grid, editor, input, startup, Dock) need a graphical
-  session and are still pending.
+- Part 10 remaining checks (gate status there): item 3 manual IME checklist,
+  human visual check of the grid end-of-list, Wayland runs, lower-end hardware.
+- Detaching a result tab to its own OS window (9.2, Later): whether the
+  second-`Root`-window technique is acceptable is a product call, to be made
+  when the feature is scheduled.
 
 ---
 
@@ -2523,6 +2570,10 @@ philosophy are named out loud rather than hidden.
 - **This document's depth vs Simplicity First.** The planning is detailed; the
   product is not. This is write-once reference material, not runtime complexity,
   so it does not violate the pillar. Worth rereading rarely, not constantly.
+- **Grid render cost vs Performance.** 6.3 keeps gpui-component's Table even
+  though it uses 8-11 ms of CPU per frame and drops to 30 fps under CPU
+  contention. Bounded by an explicit budget and a named trigger for a custom
+  grid element, instead of building one up front.
 - **Editor below Monaco vs UX First.** 0.4 and 6.1 accept a weaker editor (rich
   find-and-replace, minimap, folding, snippets, VS Code keymap absent) as the
   price of the GPUI bet. Contained to `ui`.
