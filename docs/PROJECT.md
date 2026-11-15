@@ -1903,8 +1903,35 @@ driver tests the engine logic; testcontainers tests the real driver impls; the
 tokenizer is exactly the kind of component where tables and snapshots catch
 regressions cheaply. Serves Testing and Maintainability.
 
-**Trade-off.** Integration tests need Docker or Podman available in CI.
-Standard.
+**Standardization.**
+
+1. **Layers, separated by cost.** Unit and tokenizer tests need no Docker and
+   always run (`cargo test`). Integration tests need a container runtime and sit
+   behind an `integration` cargo feature, so a plain `cargo test` stays fast for
+   anyone without Docker.
+2. **One source of truth for images.** Database images and versions are
+   declared once, in a test-support module of `core`. Initial matrix: Postgres 17
+   and MySQL 8.4; older supported versions (Postgres 14, MySQL 8.0) and MariaDB
+   are added as the matrix grows. The development compose file (below) reads the
+   same versions.
+3. **One runner.** `cargo nextest` with `default` and `ci` profiles, plus
+   `cargo test --doc` (nextest does not run doctests). The exact commands live in
+   `AGENTS.md`.
+4. **Automated tests never depend on a shared, long-lived database.** They use
+   `testcontainers` exclusively: one container per test binary, one database
+   per test.
+5. **Podman is supported** through testcontainers (`DOCKER_HOST`); the project
+   does not require Docker specifically.
+6. **Manual development environment.** A `compose.yaml` at the repository root
+   provides Postgres and MySQL with sample data for exploring the real app
+   (explorer, grid, editing) by hand. It is a developer convenience and is never
+   used by automated tests.
+
+**Trade-off.** Integration tests need Docker or Podman available locally and in
+CI, and are slower than tests against an already-running database because
+containers must start (reusing one container per binary limits this). Keeping both
+testcontainers and a development compose file means image versions live in two
+places; the single declaration in item 2 prevents drift.
 
 ---
 
