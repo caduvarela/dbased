@@ -10,6 +10,7 @@
 - Nothing.
 
 ## Next step
+- Postgres driver slice is done and reviewed (commits up to a709f08). Open product decisions: 3.2.4 (cancel inside user transactions; canceller handle API).
 - First real driver (Postgres): the 2.1 trait (Session / Canceller, `UserSql`, `health_check`), the `AssertSqlSafe` invariant in the `UserSql` conversion (1.2, rule 1), the 3.2 cancel policy with integration tests (clean cancel, late cancel, aborted transaction, drain timeout).
 - In parallel or next: real UI shell in `crates/ui` (Dock with explorer / editor / bottom result tabs, grid against a fake Core source) following the 6.3 grid rules; the editor takes focus on open and tab activation (6.1). Add `tree-sitter-sql` and `gpui-base =0.9.1` to `ui` only when first used.
 - Not next: the keymap commands, smart multi-cursor and the Later features above.
