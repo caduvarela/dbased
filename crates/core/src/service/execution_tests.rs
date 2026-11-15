@@ -13,7 +13,7 @@ use dbased_commands::{
 use secrecy::SecretString;
 
 use super::InMemorySecretStore;
-use super::tests::{Harness, ScriptedConnector, failed_kind, settings};
+use super::tests::{Harness, ScriptedConnector, failed_kind, settings, terminal_request};
 use super::tests_session::SessionLog;
 
 const TAB: TabId = TabId(1);
@@ -265,7 +265,10 @@ async fn an_empty_script_or_bad_selection_ends_the_request_without_running() {
     let events = fixture
         .run(2, "rows 1", ExecuteTarget::Selection { start: 5, end: 99 })
         .await;
-    assert_eq!(failed_kind(events.last().unwrap()), ErrorKind::Internal);
+    assert_eq!(
+        failed_kind(events.last().unwrap()),
+        ErrorKind::Configuration
+    );
     assert!(fixture.executed().is_empty());
     assert_eq!(fixture.log.opens.load(Ordering::SeqCst), 0);
 }
@@ -717,4 +720,166 @@ async fn a_statement_that_carried_extra_statements_is_reported_as_an_internal_er
         .iter()
         .any(|event| matches!(event, Event::Error { error } if error.kind == ErrorKind::Internal));
     assert!(reported, "{events:?}");
+}
+
+#[tokio::test]
+async fn a_session_closed_mid_script_stops_the_script_and_reopens_only_on_the_next_run() {
+    let fixture = Fixture::connected().await;
+    let events = fixture.run_all(1, "rows 1; closed; rows 1").await;
+    let ExecutionStatus::Aborted { statement, error } = finished_status(&events) else {
+        panic!("expected Aborted, got {events:?}");
+    };
+    assert_eq!((statement, error.kind), (1, ErrorKind::SessionClosed));
+    assert!(shape(&events).contains(&"session Reset { reason: DrainTimeout }".to_owned()));
+    assert_eq!(fixture.executed(), ["rows 1", "closed"]);
+    assert_eq!(fixture.log.opens.load(Ordering::SeqCst), 1);
+
+    fixture.run_all(2, "rows 1").await;
+    assert_eq!(fixture.log.opens.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_session_closed_by_the_last_statement_still_completes() {
+    let fixture = Fixture::connected().await;
+    let events = fixture.run_all(1, "rows 1; closed").await;
+    assert_eq!(finished_status(&events), ExecutionStatus::Completed);
+}
+
+#[tokio::test]
+async fn an_empty_script_on_a_disconnected_connection_does_not_connect() {
+    let fixture = Fixture::disconnected().await;
+    fixture.open_tab(TAB).await;
+    let events = fixture.run_all(1, " ; -- nothing").await;
+    assert_eq!(failed_kind(events.last().unwrap()), ErrorKind::EmptyScript);
+    let events = fixture
+        .run(2, "rows 1", ExecuteTarget::Selection { start: 5, end: 99 })
+        .await;
+    assert_eq!(
+        failed_kind(events.last().unwrap()),
+        ErrorKind::Configuration
+    );
+    assert_eq!(fixture.harness.connector.connects.load(Ordering::SeqCst), 0);
+    assert!(!shape(&events).contains(&"connection Connecting".to_owned()));
+
+    // The slot was never claimed.
+    let events = fixture.run_all(3, "rows 1").await;
+    assert_eq!(finished_status(&events), ExecutionStatus::Completed);
+}
+
+#[tokio::test]
+async fn cancelling_an_execute_that_waits_for_its_connection_ends_it_once() {
+    let connector = ScriptedConnector {
+        connect_delay: Duration::from_millis(300),
+        ..ScriptedConnector::default()
+    };
+    let fixture = Fixture::with_connector(connector).await;
+    fixture.open_tab(TAB).await;
+    fixture
+        .send_execute(1, TAB, "rows 1", ExecuteTarget::All)
+        .await;
+    fixture
+        .harness
+        .send(Command::Cancel {
+            tab: TAB,
+            request: RequestId(1),
+        })
+        .await;
+    let events = fixture.harness.until_terminal(RequestId(1)).await;
+    assert_eq!(
+        finished_status(&events),
+        ExecutionStatus::Cancelled { statement: 0 }
+    );
+    assert!(shape(&events).contains(&"started 1".to_owned()));
+
+    // The tab is free and the connect that was already running is not lost.
+    let events = fixture.run_all(2, "rows 1").await;
+    assert_eq!(finished_status(&events), ExecutionStatus::Completed);
+    assert_eq!(fixture.executed(), ["rows 1"]);
+    let terminals = events
+        .iter()
+        .filter(|e| terminal_request(e) == Some(RequestId(1)))
+        .count();
+    assert_eq!(terminals, 0, "request 1 must not end twice");
+}
+
+#[tokio::test]
+async fn a_failed_statement_error_reaches_the_result_even_when_execute_errors() {
+    let fixture = Fixture::connected().await;
+    let events = fixture.run_all(1, "dead").await;
+    let lines = shape(&events);
+    let started = lines.iter().position(|l| l == "result_started 0").unwrap();
+    assert_eq!(lines[started + 1], "result_finished 0 Failed");
+    let outcome = result_outcome(&events, 0);
+    assert!(outcome.error.unwrap().message.contains("closed"));
+}
+
+#[tokio::test]
+async fn releasing_a_result_before_it_exists_keeps_the_buffer_from_living() {
+    let fixture = Fixture::connected().await;
+    fixture
+        .harness
+        .send(Command::ReleaseResult {
+            result: ResultId {
+                request: RequestId(1),
+                statement: 0,
+            },
+        })
+        .await;
+    fixture.run_all(1, "rows 3").await;
+    fixture
+        .harness
+        .send(Command::FetchRows {
+            result: ResultId {
+                request: RequestId(1),
+                statement: 0,
+            },
+            start: 0,
+            count: 10,
+        })
+        .await;
+    // A later reply proves the fetch was handled before it.
+    let events = fixture.run_all(2, "rows 1").await;
+    assert!(!events.iter().any(|e| matches!(e, Event::RowsWindow { .. })));
+    assert_eq!(fixture.fetch(2, 0, 0, 10).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_tab_actor_that_panics_ends_its_request_and_closes_the_tab() {
+    let fixture = Fixture::connected().await;
+    fixture.run_all(1, "rows 2").await;
+    let events = fixture.run_all(2, "rows 1; panic").await;
+    assert_eq!(failed_kind(events.last().unwrap()), ErrorKind::Internal);
+    let closed = fixture.harness.next_event().await;
+    assert_eq!(closed, Event::TabClosed { tab: TAB });
+
+    // The tab is gone and its results were released.
+    fixture
+        .harness
+        .send(Command::FetchRows {
+            result: ResultId {
+                request: RequestId(1),
+                statement: 0,
+            },
+            start: 0,
+            count: 10,
+        })
+        .await;
+    let events = fixture.run_all(3, "rows 1").await;
+    assert_eq!(failed_kind(events.last().unwrap()), ErrorKind::UnknownTab);
+    assert!(!events.iter().any(|e| matches!(e, Event::RowsWindow { .. })));
+}
+
+#[tokio::test]
+async fn a_connect_panic_during_auto_connect_fails_the_execute_and_frees_the_tab() {
+    let connector = ScriptedConnector {
+        panic_on_connect: true,
+        ..ScriptedConnector::default()
+    };
+    let fixture = Fixture::with_connector(connector).await;
+    fixture.open_tab(TAB).await;
+    let events = fixture.run_all(1, "rows 1").await;
+    assert_eq!(failed_kind(events.last().unwrap()), ErrorKind::Internal);
+    assert!(shape(&events).contains(&"connection Disconnected".to_owned()));
+    let events = fixture.run_all(2, "rows 1").await;
+    assert_eq!(failed_kind(events.last().unwrap()), ErrorKind::Internal);
 }

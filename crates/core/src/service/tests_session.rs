@@ -141,6 +141,7 @@ impl Session for ScriptedSession {
                 self.log.slow_rows_sent.store(true, Ordering::SeqCst);
                 outcome(StatementStatus::Completed, argument)
             }
+            "panic" => panic!("scripted panic in a session"),
             "dead" => return Err(CoreError::SessionClosed(CloseReason::ConnectionError)),
             "deadrows" => {
                 stream_rows(&sink, 2).await;

@@ -6,13 +6,12 @@ use std::time::Duration;
 
 use async_channel::Sender;
 use dbased_commands::{
-    ColumnMeta, ConnectionId, DatabaseKind, Event, ExecuteTarget, ExecutionStatus, RequestId,
-    ResultId, ResultOutcome, ResultStatus, SessionResetReason, SessionState, StatementSpan, TabId,
-    Value,
+    ColumnMeta, ConnectionId, DatabaseError, DatabaseKind, Event, ExecuteTarget, ExecutionStatus,
+    RequestId, ResultId, ResultOutcome, ResultStatus, SessionResetReason, SessionState,
+    StatementSpan, TabId, Value,
 };
 use dbased_sql::{Dialect, Span, split_statements, statement_at};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -69,6 +68,11 @@ impl RunningSlot {
         }
     }
 
+    /// Empties the slot and returns the request it held.
+    pub(super) fn take(&self) -> Option<RequestId> {
+        self.lock().take().map(|(request, _)| request)
+    }
+
     pub(super) fn cancel_current(&self) {
         if let Some((_, token)) = &*self.lock() {
             token.cancel();
@@ -81,15 +85,35 @@ pub(super) struct PendingExecute {
     pub(super) request: RequestId,
     pub(super) tab: TabId,
     pub(super) script: String,
-    pub(super) target: ExecuteTarget,
+    /// Planned by the dispatcher before the slot is claimed (11.2 step 1).
+    pub(super) plan: Vec<StatementSpan>,
     pub(super) token: CancellationToken,
+}
+
+impl PendingExecute {
+    /// A request cancelled before its first statement ran ends like one cancelled at
+    /// statement 0: `ExecutionStarted`, then `ExecutionFinished(Cancelled)` with no results.
+    // @NOTE: the ordering guarantee of 11.1 stays intact and the UI needs no extra case.
+    pub(super) fn cancelled_events(&self) -> [Event; 2] {
+        let statement = self.plan.first().map_or(0, |span| span.index);
+        [
+            Event::ExecutionStarted {
+                request: self.request,
+                tab: self.tab,
+                statements: self.plan.clone(),
+            },
+            Event::ExecutionFinished {
+                request: self.request,
+                status: ExecutionStatus::Cancelled { statement },
+            },
+        ]
+    }
 }
 
 pub(super) enum TabMessage {
     Execute {
         job: PendingExecute,
         driver: Arc<dyn Driver>,
-        dialect: Dialect,
     },
     /// Closes the session and keeps the tab. The dispatcher cancels a running statement first.
     ReleaseSession { done: oneshot::Sender<()> },
@@ -101,31 +125,36 @@ pub(super) struct TabHandle {
     pub(super) connection: ConnectionId,
     pub(super) messages: mpsc::UnboundedSender<TabMessage>,
     pub(super) running: RunningSlot,
-    pub(super) task: JoinHandle<()>,
+    /// Tells this actor apart from an earlier one that served the same `TabId`.
+    pub(super) generation: u64,
 }
 
-pub(super) fn spawn_tab(
+/// The handle and the actor's run future; the dispatcher owns the task so it sees a panic.
+pub(super) fn new_tab(
     tab: TabId,
+    generation: u64,
     connection: ConnectionId,
     events: Sender<Event>,
     results: ResultStore,
-) -> TabHandle {
+) -> (TabHandle, impl Future<Output = ()> + Send + 'static) {
     let (messages, mailbox) = mpsc::unbounded_channel();
     let running = RunningSlot::default();
     let actor = TabActor {
         tab,
+        generation,
         events,
         results,
         running: running.clone(),
         session: None,
         state: SessionState::NotOpen,
     };
-    TabHandle {
+    let handle = TabHandle {
         connection,
         messages,
         running,
-        task: tokio::spawn(actor.run(mailbox)),
-    }
+        generation,
+    };
+    (handle, actor.run(mailbox))
 }
 
 pub(super) fn dialect_of(kind: DatabaseKind) -> Dialect {
@@ -137,6 +166,7 @@ pub(super) fn dialect_of(kind: DatabaseKind) -> Dialect {
 
 struct TabActor {
     tab: TabId,
+    generation: u64,
     events: Sender<Event>,
     results: ResultStore,
     running: RunningSlot,
@@ -148,18 +178,14 @@ impl TabActor {
     async fn run(mut self, mut mailbox: mpsc::UnboundedReceiver<TabMessage>) {
         while let Some(message) = mailbox.recv().await {
             match message {
-                TabMessage::Execute {
-                    job,
-                    driver,
-                    dialect,
-                } => self.execute(job, driver, dialect).await,
+                TabMessage::Execute { job, driver } => self.execute(job, driver).await,
                 TabMessage::ReleaseSession { done } => {
                     self.release_session().await;
                     done.send(()).ok();
                 }
                 TabMessage::Close { done } => {
                     self.release_session().await;
-                    self.results.release_tab(self.tab);
+                    self.results.release_tab(self.tab, self.generation);
                     emit(&self.events, Event::TabClosed { tab: self.tab }).await;
                     done.send(()).ok();
                     return;
@@ -168,7 +194,11 @@ impl TabActor {
         }
         // @NOTE: the dispatcher is gone without a Close; the session is still closed.
         self.release_session().await;
-        self.results.release_tab(self.tab);
+        self.results.release_tab(self.tab, self.generation);
+    }
+
+    fn owner(&self) -> (TabId, u64) {
+        (self.tab, self.generation)
     }
 
     async fn set_state(&mut self, state: SessionState) {
@@ -194,11 +224,11 @@ impl TabActor {
         self.set_state(SessionState::NotOpen).await;
     }
 
-    async fn execute(&mut self, job: PendingExecute, driver: Arc<dyn Driver>, dialect: Dialect) {
+    async fn execute(&mut self, job: PendingExecute, driver: Arc<dyn Driver>) {
         let request = job.request;
-        let terminal = match self.prepare(&job, driver.as_ref(), dialect).await {
-            Ok(plan) => {
-                let status = self.run_plan(&job, driver.as_ref(), plan).await;
+        let terminal = match self.prepare(&job, driver.as_ref()).await {
+            Ok(()) => {
+                let status = self.run_plan(&job).await;
                 Event::ExecutionFinished { request, status }
             }
             Err(error) => Event::RequestFailed {
@@ -216,20 +246,22 @@ impl TabActor {
         &mut self,
         job: &PendingExecute,
         driver: &dyn Driver,
-        dialect: Dialect,
-    ) -> Result<Vec<StatementSpan>, CoreError> {
-        let plan = plan_statements(&job.script, job.target, dialect)?;
-        self.ensure_session(driver).await?;
+    ) -> Result<(), CoreError> {
+        // @NOTE: a cancelled request opens no session (it may sit behind a ReleaseSession);
+        // `run_plan` then reports it cancelled before statement 0.
+        if !job.token.is_cancelled() {
+            self.ensure_session(driver).await?;
+        }
         emit(
             &self.events,
             Event::ExecutionStarted {
                 request: job.request,
                 tab: self.tab,
-                statements: plan.clone(),
+                statements: job.plan.clone(),
             },
         )
         .await;
-        Ok(plan)
+        Ok(())
     }
 
     async fn ensure_session(&mut self, driver: &dyn Driver) -> Result<(), CoreError> {
@@ -241,23 +273,17 @@ impl TabActor {
         Ok(())
     }
 
-    async fn run_plan(
-        &mut self,
-        job: &PendingExecute,
-        driver: &dyn Driver,
-        plan: Vec<StatementSpan>,
-    ) -> ExecutionStatus {
-        for span in plan {
+    async fn run_plan(&mut self, job: &PendingExecute) -> ExecutionStatus {
+        let last = job.plan.len().saturating_sub(1);
+        for (position, span) in job.plan.iter().copied().enumerate() {
             if job.token.is_cancelled() {
                 return ExecutionStatus::Cancelled {
                     statement: span.index,
                 };
             }
-            let ready = self.ensure_session(driver).await;
-            let outcome = match ready {
-                Ok(()) => self.run_statement(job, span).await,
-                Err(error) => Err(error),
-            };
+            // @NOTE: the session is opened once, in `prepare`. A session closed mid-script ends
+            // the script, so the next statement never runs on a fresh one.
+            let outcome = self.run_statement(job, span, position < last).await;
             match outcome {
                 Ok(None) => {}
                 Ok(Some(status)) => return status,
@@ -272,6 +298,7 @@ impl TabActor {
         &mut self,
         job: &PendingExecute,
         span: StatementSpan,
+        more_follow: bool,
     ) -> Result<Option<ExecutionStatus>, CoreError> {
         let result = ResultId {
             request: job.request,
@@ -286,8 +313,12 @@ impl TabActor {
             .ok_or_else(|| CoreError::Internal("the tab has no session".to_owned()))?;
 
         let (sink, mut receiver) = RowSink::channel(SINK_CAPACITY);
-        let mut collector =
-            Collector::new(self.events.clone(), self.results.clone(), self.tab, result);
+        let mut collector = Collector::new(
+            self.events.clone(),
+            self.results.clone(),
+            self.owner(),
+            result,
+        );
         // @NOTE: join, never select: the execute future runs to its terminal result (3.2).
         let (executed, ()) = tokio::join!(
             session.execute(UserSql::new(text), sink, job.token.clone()),
@@ -297,7 +328,7 @@ impl TabActor {
         match executed {
             Ok(outcome) => {
                 collector.ensure_started().await;
-                self.finish_statement(session, collector, span, outcome)
+                self.finish_statement(session, collector, span, outcome, more_follow)
                     .await
             }
             Err(error) => {
@@ -313,6 +344,7 @@ impl TabActor {
         collector: Collector,
         span: StatementSpan,
         outcome: StatementOutcome,
+        more_follow: bool,
     ) -> Result<Option<ExecutionStatus>, CoreError> {
         if outcome.extra_statements_discarded {
             // @NOTE: only the splitter builds statements, so this is a splitter bug.
@@ -325,15 +357,7 @@ impl TabActor {
             )
             .await;
         }
-        if let Some(error) = &collector.failure {
-            emit(
-                &self.events,
-                Event::Error {
-                    error: error_info(error),
-                },
-            )
-            .await;
-        }
+        collector.report_failure().await;
         emit(
             &self.events,
             Event::ResultFinished {
@@ -343,6 +367,7 @@ impl TabActor {
         )
         .await;
 
+        let mut closed = None;
         match outcome.session {
             SessionHealth::Healthy => {
                 self.session = Some(session);
@@ -358,11 +383,14 @@ impl TabActor {
                     reason: reset_reason(reason),
                 })
                 .await;
+                closed = Some(reason);
             }
         }
 
         let stop = match outcome.status {
-            StatementStatus::Completed | StatementStatus::Truncated => None,
+            StatementStatus::Completed | StatementStatus::Truncated => closed
+                .filter(|_| more_follow)
+                .map(|reason| aborted(span.index, &CoreError::SessionClosed(reason))),
             StatementStatus::Failed => Some(ExecutionStatus::StoppedOnError {
                 statement: span.index,
             }),
@@ -376,27 +404,29 @@ impl TabActor {
     async fn abort_statement(
         &mut self,
         session: Box<dyn Session>,
-        collector: Collector,
+        mut collector: Collector,
         error: &CoreError,
     ) {
-        if collector.started {
-            let outcome = ResultOutcome {
-                status: ResultStatus::Failed,
-                rows_received: collector.buffered,
-                rows_affected: None,
-                partial: true,
-                error: None,
-                cancel_error: None,
-            };
-            emit(
-                &self.events,
-                Event::ResultFinished {
-                    result: collector.result,
-                    outcome,
-                },
-            )
-            .await;
-        }
+        // @NOTE: a failed statement still gets its ResultStarted and a ResultFinished that
+        // carries the error (11.1), exactly like a statement the server rejected.
+        collector.ensure_started().await;
+        collector.report_failure().await;
+        let outcome = ResultOutcome {
+            status: ResultStatus::Failed,
+            rows_received: collector.buffered,
+            rows_affected: None,
+            partial: true,
+            error: Some(failure_detail(error)),
+            cancel_error: None,
+        };
+        emit(
+            &self.events,
+            Event::ResultFinished {
+                result: collector.result,
+                outcome,
+            },
+        )
+        .await;
         // @NOTE: after a session-level error the protocol state is unknown, so it is not reused.
         session.close().await;
         let reason = match error {
@@ -404,6 +434,20 @@ impl TabActor {
             _ => SessionResetReason::ConnectionError,
         };
         self.set_state(SessionState::Reset { reason }).await;
+    }
+}
+
+/// The result outcome only has a database-shaped error; a session-level failure has no SQLSTATE.
+fn failure_detail(error: &CoreError) -> DatabaseError {
+    match error {
+        CoreError::Database(info) => database_error(info),
+        other => DatabaseError {
+            sqlstate: String::new(),
+            message: other.to_string(),
+            detail: None,
+            hint: None,
+            position: None,
+        },
     }
 }
 
@@ -444,7 +488,7 @@ fn result_outcome(outcome: &StatementOutcome) -> ResultOutcome {
 
 /// Which statements one `Execute` runs, as spans into the script. The raw script never reaches
 /// a driver: only one `Statement` text at a time becomes `UserSql` (docs/PROJECT.md 11.2).
-fn plan_statements(
+pub(super) fn plan_statements(
     script: &str,
     target: ExecuteTarget,
     dialect: Dialect,
@@ -462,7 +506,7 @@ fn plan_statements(
         }
         ExecuteTarget::Selection { start, end } => {
             let selected = script.get(start..end).ok_or_else(|| {
-                CoreError::Internal("the selection is not a valid range of the script".to_owned())
+                CoreError::Configuration("the selection is not a valid range of the script".into())
             })?;
             split_statements(selected, dialect)
                 .iter()
@@ -492,7 +536,7 @@ fn plan_statements(
 struct Collector {
     events: Sender<Event>,
     results: ResultStore,
-    tab: TabId,
+    owner: (TabId, u64),
     result: ResultId,
     rows: Option<ResultRows>,
     started: bool,
@@ -502,11 +546,16 @@ struct Collector {
 }
 
 impl Collector {
-    fn new(events: Sender<Event>, results: ResultStore, tab: TabId, result: ResultId) -> Self {
+    fn new(
+        events: Sender<Event>,
+        results: ResultStore,
+        owner: (TabId, u64),
+        result: ResultId,
+    ) -> Self {
         Self {
             events,
             results,
-            tab,
+            owner,
             result,
             rows: None,
             started: false,
@@ -553,8 +602,10 @@ impl Collector {
         }
         self.started = true;
         // @NOTE: the buffer exists before the event, so a FetchRows after it always finds it.
-        match self.results.create(self.tab, self.result) {
-            Ok(rows) => self.rows = Some(rows),
+        let (tab, generation) = self.owner;
+        match self.results.create(tab, generation, self.result) {
+            // @NOTE: `None` means the UI already released this result; rows are then dropped.
+            Ok(rows) => self.rows = rows,
             Err(error) => self.failure = Some(error),
         }
         self.events
@@ -564,6 +615,14 @@ impl Collector {
             })
             .await
             .ok();
+    }
+
+    async fn report_failure(&self) {
+        let Some(error) = &self.failure else { return };
+        let event = Event::Error {
+            error: error_info(error),
+        };
+        emit(&self.events, event).await;
     }
 
     /// A failed statement still gets a `ResultStarted`, with empty columns (11.1).
