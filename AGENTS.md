@@ -49,7 +49,7 @@ cargo tree -p dbased-ui | grep dbased-core # must print nothing
 
 Run fmt, clippy and tests before every commit. Rust toolchain is pinned in `rust-toolchain.toml`.
 
-Integration tests (real Postgres/MySQL via testcontainers) will live behind the `integration` cargo feature; it does not exist yet.
+Integration tests (real Postgres/MySQL via testcontainers) live behind the `integration` cargo feature of `dbased-core` (`cargo test -p dbased-core --features integration`, needs Docker; images come from `.env`).
 
 Manual dev databases with sample data (never used by tests; see `dev/README.md`):
 

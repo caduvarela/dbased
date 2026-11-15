@@ -1,0 +1,501 @@
+#![cfg(feature = "integration")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod support;
+
+use std::time::Duration;
+
+use dbased_commands::Value;
+use dbased_core::drivers::postgres::{PostgresDriver, TlsMode};
+use dbased_core::{
+    CloseReason, CoreError, Driver, DriverFactory, RowSink, Session, SessionHealth, SessionLimits,
+    StatementStatus, TableRef, UserSql,
+};
+use secrecy::SecretString;
+use support::{TestDatabase, run, run_with};
+use tokio_util::sync::CancellationToken;
+
+async fn open(database: &TestDatabase) -> (Box<dyn Driver>, Box<dyn Session>) {
+    open_with(database.config()).await
+}
+
+async fn open_with(
+    config: dbased_core::drivers::postgres::PostgresConfig,
+) -> (Box<dyn Driver>, Box<dyn Session>) {
+    let driver = PostgresDriver::connect(config).await.expect("connects");
+    let session = driver.open_session().await.expect("opens a session");
+    (driver, session)
+}
+
+fn cancel_after(token: &CancellationToken, delay: Duration) {
+    let token = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        token.cancel();
+    });
+}
+
+#[tokio::test]
+async fn session_id_is_the_backend_pid() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+    let id = session.session_id();
+
+    let mut admin = database.admin().await;
+    let known: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE pid = $1")
+        .bind(i32::try_from(id.0).unwrap())
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(known, 1);
+
+    let result = run(&mut session, "SELECT pg_backend_pid()").await;
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Int(i64::try_from(id.0).unwrap())]]
+    );
+}
+
+#[tokio::test]
+async fn streams_a_multi_row_result_with_headers_first() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+
+    let result = run(
+        &mut session,
+        "SELECT g AS n, 'row ' || g AS label FROM generate_series(1, 1000) g",
+    )
+    .await;
+
+    assert_eq!(result.outcome.status, StatementStatus::Completed);
+    assert_eq!(result.outcome.rows_received, 1000);
+    assert_eq!(result.outcome.rows_affected, None);
+    assert_eq!(result.rows.len(), 1000);
+    assert_eq!(result.columns.len(), 2);
+    assert_eq!(result.columns[0].name, "n");
+    assert_eq!(result.columns[0].type_name, "INT4");
+    assert_eq!(result.rows[999][1], Value::Text("row 1000".into()));
+}
+
+#[tokio::test]
+async fn headers_and_zero_rows_for_an_empty_select() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+
+    let result = run(&mut session, "SELECT 1 AS one WHERE false").await;
+
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(result.columns[0].name, "one");
+    assert_eq!(result.outcome.rows_received, 0);
+    assert_eq!(result.outcome.rows_affected, None);
+}
+
+#[tokio::test]
+async fn rows_affected_is_reported_only_for_statements_without_rows() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+
+    run(&mut session, "CREATE TEMP TABLE t (id int)").await;
+    let inserted = run(&mut session, "INSERT INTO t VALUES (1), (2), (3)").await;
+
+    assert_eq!(inserted.outcome.rows_affected, Some(3));
+    assert!(inserted.columns.is_empty());
+}
+
+#[tokio::test]
+async fn one_statement_per_call_extra_statements_are_flagged_and_not_streamed() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+
+    let result = run(&mut session, "SELECT 1; SELECT 2").await;
+
+    assert!(result.outcome.extra_statements_discarded);
+    assert_eq!(result.rows, vec![vec![Value::Int(1)]]);
+}
+
+#[tokio::test]
+async fn syntax_errors_carry_sqlstate_and_position() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+
+    let result = run(&mut session, "SELEC 1").await;
+
+    assert_eq!(result.outcome.status, StatementStatus::Failed);
+    let error = result.outcome.server_error.expect("server error");
+    assert_eq!(error.sqlstate, "42601");
+    assert_eq!(error.position, Some(1));
+    assert_eq!(result.outcome.session, SessionHealth::Healthy);
+}
+
+#[tokio::test]
+async fn value_matrix() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+    run(&mut session, "CREATE TYPE mood AS ENUM ('sad', 'happy')").await;
+    run(&mut session, "CREATE TYPE pair AS (a int, b text)").await;
+
+    let result = run(
+        &mut session,
+        "SELECT 12345678901234567890.123456789::numeric AS num, \
+                '2024-03-05 10:20:30.5+02'::timestamptz AS tz, \
+                interval '1 day 2 hours' AS iv, \
+                ARRAY[1,2,3]::int4[] AS arr, \
+                '{\"a\":[1,2]}'::jsonb AS j, \
+                '\\xdeadbeef'::bytea AS b, \
+                '123e4567-e89b-12d3-a456-426614174000'::uuid AS u, \
+                'happy'::mood AS e, \
+                ROW(1,'x')::pair AS c, \
+                NULL::int AS nul, \
+                true AS flag, \
+                1.5::float8 AS f, \
+                7::int2 AS small, \
+                'abc'::text AS t, \
+                DATE '2024-03-05' AS d, \
+                TIME '10:20:30' AS tm",
+    )
+    .await;
+
+    let row = &result.rows[0];
+    assert_eq!(
+        row[0],
+        Value::Decimal("12345678901234567890.123456789".into())
+    );
+    assert_eq!(row[1], Value::Timestamp("2024-03-05 08:20:30.5+00".into()));
+    assert_eq!(row[2], Value::Unknown("1 day 02:00:00".into()));
+    assert_eq!(row[3], Value::Unknown("{1,2,3}".into()));
+    assert_eq!(row[4], Value::Json("{\"a\": [1, 2]}".into()));
+    assert_eq!(row[5], Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+    assert_eq!(
+        row[6],
+        Value::Uuid("123e4567-e89b-12d3-a456-426614174000".into())
+    );
+    assert_eq!(row[7], Value::Unknown("happy".into()));
+    assert_eq!(row[8], Value::Unknown("(1,x)".into()));
+    assert_eq!(row[9], Value::Null);
+    assert_eq!(row[10], Value::Bool(true));
+    assert_eq!(row[11], Value::Float(1.5));
+    assert_eq!(row[12], Value::Int(7));
+    assert_eq!(row[13], Value::Text("abc".into()));
+    assert_eq!(row[14], Value::Date("2024-03-05".into()));
+    assert_eq!(row[15], Value::Time("10:20:30".into()));
+    // Enum and composite OIDs are resolved through pg_type (docs/PROJECT.md 2.5).
+    assert_eq!(result.columns[7].type_name, "mood");
+    assert_eq!(result.columns[8].type_name, "pair");
+}
+
+#[tokio::test]
+async fn clean_cancel_keeps_the_session_and_its_temp_table() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+    run(&mut session, "CREATE TEMP TABLE kept (id int)").await;
+    run(&mut session, "INSERT INTO kept VALUES (42)").await;
+
+    let token = CancellationToken::new();
+    cancel_after(&token, Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let result = run_with(&mut session, "SELECT pg_sleep(30)", token).await;
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(result.outcome.status, StatementStatus::Cancelled);
+    assert!(result.outcome.partial);
+    assert_eq!(
+        result.outcome.server_error.as_ref().unwrap().sqlstate,
+        "57014"
+    );
+    assert_eq!(result.outcome.session, SessionHealth::Healthy);
+    assert!(result.outcome.cancel_error.is_none());
+
+    let after = run(&mut session, "SELECT id FROM kept").await;
+    assert_eq!(after.rows, vec![vec![Value::Int(42)]]);
+}
+
+#[tokio::test]
+async fn a_cancel_racing_the_end_of_the_statement_never_hits_the_next_one() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+
+    for step in 0..40u64 {
+        let token = CancellationToken::new();
+        cancel_after(&token, Duration::from_millis(step * 2));
+        let result = run_with(&mut session, "SELECT pg_sleep(0.04)", token).await;
+        assert!(
+            matches!(
+                result.outcome.status,
+                StatementStatus::Cancelled | StatementStatus::Completed
+            ),
+            "step {step}: {:?}",
+            result.outcome
+        );
+        assert_eq!(
+            result.outcome.session,
+            SessionHealth::Healthy,
+            "step {step}"
+        );
+
+        let next = run(&mut session, "SELECT 7").await;
+        assert_eq!(
+            next.outcome.status,
+            StatementStatus::Completed,
+            "step {step}: {:?}",
+            next.outcome
+        );
+        assert_eq!(next.rows, vec![vec![Value::Int(7)]]);
+    }
+}
+
+#[tokio::test]
+async fn cancel_inside_a_transaction_reports_aborted_and_rollback_recovers() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+    run(&mut session, "BEGIN").await;
+
+    let token = CancellationToken::new();
+    cancel_after(&token, Duration::from_millis(300));
+    let cancelled = run_with(&mut session, "SELECT pg_sleep(30)", token).await;
+    assert_eq!(cancelled.outcome.status, StatementStatus::Cancelled);
+    assert_eq!(cancelled.outcome.session, SessionHealth::TransactionAborted);
+
+    let blocked = run(&mut session, "SELECT 1").await;
+    let error = blocked.outcome.server_error.expect("25P02");
+    assert_eq!(error.sqlstate, "25P02");
+    assert_eq!(blocked.outcome.session, SessionHealth::TransactionAborted);
+    assert_eq!(
+        session.health_check().await.unwrap(),
+        SessionHealth::TransactionAborted
+    );
+
+    let rollback = run(&mut session, "ROLLBACK").await;
+    assert_eq!(rollback.outcome.status, StatementStatus::Completed);
+    let alive = run(&mut session, "SELECT 1").await;
+    assert_eq!(alive.rows, vec![vec![Value::Int(1)]]);
+}
+
+#[tokio::test]
+async fn drain_timeout_closes_the_session() {
+    let database = TestDatabase::create().await;
+    let mut config = database.config();
+    config.drain_timeout = Duration::from_millis(400);
+    let (_driver, mut session) = open_with(config).await;
+
+    // A loop that swallows every cancel, so the statement never reaches its end in time.
+    let stubborn = "DO $$ BEGIN FOR i IN 1..40 LOOP BEGIN PERFORM pg_sleep(0.25); \
+                    EXCEPTION WHEN query_canceled THEN NULL; END; END LOOP; END $$";
+    let token = CancellationToken::new();
+    cancel_after(&token, Duration::from_millis(200));
+    let result = run_with(&mut session, stubborn, token).await;
+
+    assert_eq!(result.outcome.status, StatementStatus::Cancelled);
+    assert_eq!(
+        result.outcome.session,
+        SessionHealth::Closed(CloseReason::DrainTimeout)
+    );
+    let (sink, _receiver) = RowSink::channel(1);
+    let next = session
+        .execute(UserSql::new("SELECT 1"), sink, CancellationToken::new())
+        .await;
+    assert!(matches!(
+        next,
+        Err(CoreError::SessionClosed(CloseReason::DrainTimeout))
+    ));
+}
+
+#[tokio::test]
+async fn row_cap_cancels_explicitly_drains_and_keeps_the_session() {
+    let database = TestDatabase::create().await;
+    let mut config = database.config();
+    config.limits = SessionLimits {
+        max_rows: 100,
+        ..SessionLimits::default()
+    };
+    let (_driver, mut session) = open_with(config).await;
+
+    let result = run(&mut session, "SELECT g FROM generate_series(1, 5000000) g").await;
+
+    assert_eq!(result.outcome.status, StatementStatus::Truncated);
+    assert!(result.outcome.partial);
+    assert_eq!(result.outcome.rows_received, 100);
+    assert_eq!(result.rows.len(), 100);
+    assert_eq!(result.outcome.session, SessionHealth::Healthy);
+    let next = run(&mut session, "SELECT 1").await;
+    assert_eq!(next.outcome.status, StatementStatus::Completed);
+}
+
+#[tokio::test]
+async fn a_result_exactly_at_the_row_cap_is_not_truncated() {
+    let database = TestDatabase::create().await;
+    let mut config = database.config();
+    config.limits.max_rows = 10;
+    let (_driver, mut session) = open_with(config).await;
+
+    let result = run(&mut session, "SELECT g FROM generate_series(1, 10) g").await;
+
+    assert_eq!(result.outcome.status, StatementStatus::Completed);
+    assert_eq!(result.outcome.rows_received, 10);
+}
+
+#[tokio::test]
+async fn memory_cap_truncates_too() {
+    let database = TestDatabase::create().await;
+    let mut config = database.config();
+    config.limits.max_bytes = 4096;
+    let (_driver, mut session) = open_with(config).await;
+
+    let result = run(
+        &mut session,
+        "SELECT repeat('x', 1000) FROM generate_series(1, 100000)",
+    )
+    .await;
+
+    assert_eq!(result.outcome.status, StatementStatus::Truncated);
+    assert!(result.outcome.rows_received >= 1 && result.outcome.rows_received < 100);
+    assert_eq!(result.outcome.session, SessionHealth::Healthy);
+}
+
+#[tokio::test]
+async fn a_dropped_execute_future_poisons_the_session() {
+    let database = TestDatabase::create().await;
+    let (_driver, mut session) = open(&database).await;
+    let id = session.session_id();
+
+    let (sink, _receiver) = RowSink::channel(1);
+    let execution = session.execute(
+        UserSql::new("SELECT pg_sleep(30)"),
+        sink,
+        CancellationToken::new(),
+    );
+    let timed_out = tokio::time::timeout(Duration::from_millis(200), execution).await;
+    assert!(timed_out.is_err());
+
+    assert_eq!(
+        session.health_check().await.unwrap(),
+        SessionHealth::Closed(CloseReason::FutureDropped)
+    );
+    let (sink, _receiver) = RowSink::channel(1);
+    let next = session
+        .execute(UserSql::new("SELECT 1"), sink, CancellationToken::new())
+        .await;
+    assert!(matches!(
+        next,
+        Err(CoreError::SessionClosed(CloseReason::FutureDropped))
+    ));
+
+    // The abandoned statement was cancelled and the connection closed on release.
+    let mut admin = database.admin().await;
+    for _ in 0..40 {
+        let alive: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE pid = $1")
+            .bind(i32::try_from(id.0).unwrap())
+            .fetch_one(&mut admin)
+            .await
+            .unwrap();
+        if alive == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the abandoned backend is still alive");
+}
+
+#[tokio::test]
+async fn closing_a_session_ends_the_backend() {
+    let database = TestDatabase::create().await;
+    let (_driver, session) = open(&database).await;
+    let id = session.session_id();
+    session.close().await;
+
+    let mut admin = database.admin().await;
+    for _ in 0..40 {
+        let alive: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE pid = $1")
+            .bind(i32::try_from(id.0).unwrap())
+            .fetch_one(&mut admin)
+            .await
+            .unwrap();
+        if alive == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the backend survived close");
+}
+
+#[tokio::test]
+async fn wrong_password_is_an_authentication_error() {
+    let database = TestDatabase::create().await;
+    let mut config = database.config();
+    config.password = SecretString::from("wrong");
+
+    let error = PostgresDriver::connect(config).await.err().expect("fails");
+
+    assert_eq!(error.kind(), "authentication", "{error}");
+}
+
+#[tokio::test]
+async fn unreachable_host_is_a_connection_error() {
+    let database = TestDatabase::create().await;
+    let mut config = database.config();
+    config.port = 1;
+
+    let error = PostgresDriver::connect(config).await.err().expect("fails");
+
+    assert_eq!(error.kind(), "connection", "{error}");
+}
+
+#[tokio::test]
+async fn require_fails_clearly_against_a_server_without_tls() {
+    let database = TestDatabase::create().await;
+    let mut config = database.config();
+    config.tls = TlsMode::Require;
+
+    let error = PostgresDriver::connect(config).await.err().expect("fails");
+
+    assert_eq!(error.kind(), "tls", "{error}");
+}
+
+#[tokio::test]
+async fn prefer_is_an_explicit_opt_in_that_falls_back_to_plaintext() {
+    let database = TestDatabase::create().await;
+    let mut config = database.config();
+    config.tls = TlsMode::Prefer;
+
+    let (_driver, mut session) = open_with(config).await;
+
+    assert_eq!(
+        run(&mut session, "SELECT 1").await.rows,
+        vec![vec![Value::Int(1)]]
+    );
+}
+
+#[tokio::test]
+async fn metadata_lists_schemas_tables_and_columns() {
+    let database = TestDatabase::create().await;
+    let (driver, mut session) = open(&database).await;
+    run(
+        &mut session,
+        "CREATE TABLE people (id int NOT NULL, name text)",
+    )
+    .await;
+    run(&mut session, "CREATE VIEW adults AS SELECT * FROM people").await;
+
+    let schemas = driver.list_schemas().await.unwrap();
+    assert!(schemas.iter().any(|schema| schema.name == "public"));
+    let tables = driver.list_tables("public").await.unwrap();
+    assert_eq!(
+        tables,
+        vec![TableRef {
+            schema: "public".into(),
+            name: "people".into()
+        }]
+    );
+    let views = driver.list_views("public").await.unwrap();
+    assert_eq!(views.len(), 1);
+    let columns = driver.list_columns(&tables[0]).await.unwrap();
+    assert_eq!(columns.len(), 2);
+    assert_eq!(
+        (columns[0].name.as_str(), columns[0].nullable),
+        ("id", false)
+    );
+    assert_eq!(columns[1].data_type, "text");
+    assert!(matches!(
+        driver.list_routines("public").await,
+        Err(CoreError::NotImplemented(_))
+    ));
+}

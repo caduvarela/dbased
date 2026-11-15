@@ -10,6 +10,7 @@ mod values;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::PgConnection;
@@ -59,12 +60,17 @@ impl DriverFactory for PostgresDriver {
 
     async fn connect(config: PostgresConfig) -> Result<Box<dyn Driver>, CoreError> {
         let options = config.connect_options();
-        // @NOTE: connecting eagerly surfaces bad credentials and TLS problems at "Open Connection".
+        // @NOTE: one direct connect first, because a pool retries and would hide the typed error.
+        PgConnection::connect_with(&options)
+            .await
+            .map_err(map_sqlx_error)?
+            .close()
+            .await
+            .ok();
         let pool = PgPoolOptions::new()
             .max_connections(config.pool_max_connections)
-            .connect_with(options.clone())
-            .await
-            .map_err(map_sqlx_error)?;
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_lazy_with(options.clone());
         let canceller = Arc::new(PostgresCanceller::new(
             pool.clone(),
             options.clone(),
