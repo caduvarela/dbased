@@ -14,6 +14,7 @@
 ## Next step
 - Run the week-one spike (docs/PROJECT.md, Part 10) before building the real UI: 5M-row windowed grid, 100k-line editor with multi-cursor, IME/Wayland, startup time, Dock round-trip, sqlparser tokenizer behavior, keyring stores, driver gotchas (cancel, raw_sql, Value matrix).
 - Then apply the Session/Canceller split to the `Driver` trait (2.1) with the first real driver.
+- With the first real driver, replace the provisional `@NOTE` about `AssertSqlSafe` above the `Driver` trait with a `UserSql` newtype and one conversion function per driver carrying a short, version-independent comment (docs/PROJECT.md, 1.2, rule 1).
 
 ## Open questions
 - Default keymap preset (recommendation: DBeaver-like).
