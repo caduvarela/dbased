@@ -6,6 +6,11 @@ use crate::{CoreError, DatabaseErrorInfo};
 pub(super) const TRANSACTION_ABORTED: &str = "25P02";
 pub(super) const QUERY_CANCELED: &str = "57014";
 
+/// Connection exceptions (class 08) and operator shutdowns (57P01..57P05) end the session.
+pub(super) fn sqlstate_means_session_lost(sqlstate: &str) -> bool {
+    sqlstate.starts_with("08") || sqlstate.starts_with("57P0")
+}
+
 pub(super) fn database_error_info(error: &dyn DatabaseError) -> DatabaseErrorInfo {
     let postgres_error = error.try_downcast_ref::<PgDatabaseError>();
     let position = postgres_error
