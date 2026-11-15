@@ -87,6 +87,7 @@ reasoning kept, rather than deleted.
     a shared pure crate (9.4.1, 1.3, 2.7).
   - Fragment debugging grows into a step-by-step debug mode with a block
     tree, per-step row counts and read-only safety (9.5).
+  - New: SQL formatting with portable, deterministic style files (9.6).
 
 ---
 
@@ -2516,14 +2517,84 @@ bisection ("why zero rows": drop `WHERE` predicates one at a time to find the
 one that removes every row).
 
 **Why.** Large companies run huge legacy SQL with many nested blocks, and
-debugging them today means copying fragments by hand. No mainstream client does
-this well. Hidden Power on top of the parser already in the stack. Serves UX
-and Hidden Power.
+debugging them today means copying fragments by hand. Built on the parser
+already in the stack. Serves UX and Hidden Power.
 
 **Trade-off.** Real complexity: rewriting has dialect edge cases, correlation
 detection is heuristic, and each step costs a query. Kept safe by refusing
 non-reads, the read-only transaction and always-visible SQL; deferred until the
 core loop is solid.
+
+### 9.6 SQL formatting with portable styles (Later) *(new 2026-11)*
+
+**Decision (future).** There is no shared standard for SQL formatting. DBased
+treats formatting as a **specification problem**: a portable style format plus
+a deterministic engine, so a team can define a style once and get the same
+output on every machine.
+
+- **Style file.** Declarative data only, never code, so importing someone
+  else's style is safe. One TOML file with a schema version, a minimum engine
+  version, a name, a description, the dialects it applies to, and its rules.
+  It may extend a bundled preset and store only the differences (presets only,
+  not other files, so a style never depends on a chain of remote files).
+  Field names are fixed with the format; for example:
+
+  ```toml
+  format = 1
+  min_engine = "1.0"
+  name = "acme"
+  dialects = ["postgres", "mysql"]
+  extends = "preset:<name>"
+  [rules]
+  keyword_case = "upper"
+  comma = "leading"
+  max_width = 100
+  ```
+
+- **Sharing.** By file, git repository or URL. Import is explicit: the file is
+  validated against its schema and stored as a local copy; a URL is fetched
+  once and never updated behind the user's back.
+- **Determinism.** Same input, same style file and same engine version give
+  the same output on any machine. The spec ships a **conformance suite**
+  (input, style, expected output snapshots) per format version; every engine
+  release passes the suites of all format versions it supports. Output
+  changes within a format version are bug fixes only, each adding a
+  conformance case and a release note; a deliberate style change needs a new
+  format version.
+- **Engine.** In the Core, on top of the in-house scanner (2.7), with a light
+  structural layer (parenthesis depth, clause keywords). It keeps every
+  comment, never touches string, quoted identifier or dollar-quote contents,
+  and leaves any region it does not understand verbatim. After formatting it
+  re-scans and checks that the token stream is unchanged except for whitespace
+  and keyword case; if not, it aborts and changes nothing. It does **not**
+  print `sqlparser`'s AST back to text, which loses comments and layout. The
+  `sqlformat` crate is only a baseline to compare against, not adopted.
+- **Rules.** A small, deliberate set: keyword case, indentation, comma
+  position, line breaks for `JOIN`, `AND` / `OR` and clauses, maximum width,
+  plus dialect handling (dollar-quoted bodies, `DELIMITER`, MySQL `ON
+  DUPLICATE KEY UPDATE`). Fewer options give more consensus (Prettier's
+  lesson) and keep Simplicity.
+- **No Magic.** Formatting runs only on command (Shift+Alt+F in the default
+  preset, 9.4), on the whole document or the selection, as one undo step.
+  Never on save or on run.
+- **CI check.** A Core-only command line entry, `dbased fmt --check`, exits
+  non-zero when files differ from the style, so a team can enforce it. A
+  connection may override the style used for its tabs.
+
+Phasing: (1) engine with one fixed default style; (2) style format v1 and 3-4
+presets (names and contents chosen later); (3) import / export; (4) the CLI
+check; (5) maybe a place to share styles. Reading sqlfluff or pgFormatter
+configs is a later step, not a goal.
+
+**Why.** Formatting debates cost teams time, and no style travels between
+tools. A portable, safe, deterministic style turns DBased into the place where
+a team's SQL style is defined. Serves UX and Maintainability (of the users'
+SQL), and fits Core Independence (the engine runs without a UI).
+
+**Trade-off.** Ambitious: a spec, a conformance suite and an engine to
+maintain, and correctness risk (a formatter must never change meaning; the
+token check guards it). Scope creep is the main danger, so the rule set stays
+small and compatibility with other tools waits.
 
 ---
 
@@ -2688,6 +2759,8 @@ fallback paths (a wrapped or custom editor element) remain available.
   follow VS Code on Linux (Shift+Alt adds cursors, Ctrl+Shift+Alt copies
   lines). Also to confirm: `Ctrl+.` opens DBased's symbol picker instead of
   upstream code actions (6.1).
+- Formatting presets (9.6): names and contents of the 3-4 bundled presets,
+  chosen by the product owner when phase 2 is scheduled.
 - Documentation strategy is being defined separately and, once agreed, becomes
   its own standard (and likely a Constitution pillar).
 - Part 10 remaining checks (gate status there): CJK composition with a real
@@ -2765,6 +2838,10 @@ philosophy are named out loud rather than hidden.
   drain, health check, sessions outside the pool, cancelled pool connections
   closed. The cost is a policy we must test ourselves; `tokio-postgres` stays
   the prepared escape hatch.
+- **Formatting styles vs Simplicity.** 9.6 adds configuration, which Simplicity
+  First warns against. Bounded by a small rule set, presets, and one portable
+  file instead of a settings sprawl; the payoff is less configuration across a
+  team, not more.
 - **Smart multi-cursor on by default vs No Magic.** 9.4.1 places a new cursor
   by structure, not straight down. Bounded by one simple, documented rule, a
   plain fallback, and a setting that turns it off.
