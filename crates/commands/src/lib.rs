@@ -7,4 +7,4 @@ mod value;
 
 pub use command::{Command, ConnectionConfig, JobId};
 pub use event::Event;
-pub use value::Value;
+pub use value::{ColumnMeta, Value};

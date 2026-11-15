@@ -1819,6 +1819,46 @@ more states to test (clean, late cancel, aborted transaction, drain timeout).
 The spike verified the clean path on simple-protocol queries only. If Postgres cancel proves fragile, the `tokio-postgres` escape hatch
 (1.2) provides a native wire-level cancel.
 
+#### 3.2.4 Postgres driver: implementation status and deviations *(new 2026-11)*
+
+Recorded after the first Postgres slice and an independent review:
+
+- **Multi-statement strings run in full on the server.** `raw_sql` executes
+  every statement (`SELECT 1; DROP TABLE x` drops the table). The driver only
+  reports `extra_statements_discarded` afterwards. The caller must split
+  scripts first (9.2, needs the `dbased-sql` scanner).
+- **The pool is lazy.** `connect` opens one direct connection, then builds the
+  pool lazily, so typed connect errors surface at once. The first cancel can
+  therefore pay the pool's first connect and fall back to the one-off cancel
+  connection.
+- **Describe runs on the user's session** (Parse of the user SQL). Inside a
+  transaction it can block on locks; a timeout closes the session.
+- **Abnormal close** (drain timeout, error, dropped future, failed health
+  check) cancels the backend while the connection is still held, then drops
+  the socket. A dropped `execute` future is only cancelled on the next call or
+  on `close()`; callers must always call `close()`.
+- **Unsupported for now:** COPY via `raw_sql` (closes the session), session
+  idle timeout and reconnect, connect timeouts, parameterized/extended
+  protocol, `list_routines`.
+- **Decided (2026-11), Core-initiated cancel inside a user transaction:** a
+  row cap or a gone consumer must not abort the user's `BEGIN` block. While a
+  transaction is open the driver drains and discards the remaining rows
+  instead of cancelling. An explicit user cancel still cancels. Requires
+  reliable transaction-state tracking (sqlx hides the ReadyForQuery status).
+  *Implemented:* the session tracks Idle / InTransaction / Unknown. Plain
+  DML/DDL statements keep the state without a round trip; anything else
+  (BEGIN, COMMIT, ROLLBACK, DO, CALL, scripts) gets one probe,
+  `transaction_timestamp() = statement_timestamp()`. Unknown counts as inside
+  a transaction (a false "inside" only costs time). Trade-off: a discard has
+  no drain timeout, so a huge result inside a transaction is read to the end
+  unless the user cancels.
+- **Decided (2026-11), canceller API:** cancellation goes through a handle tied
+  to a live session, never a bare `SessionId`, so a cancel can only reach the
+  backend while the Core still holds that connection (no PID-reuse hazard).
+  *Implemented:* `Session::cancel_handle()` returns a cloneable `CancelHandle`;
+  cancel after close returns `SessionClosed`, and a lock on a "connection still
+  held" flag orders a cancel against the close.
+
 ### 3.3 Export *(revised 2026-11)*
 
 **Decision.** CSV export streams directly from a fresh query to disk via a

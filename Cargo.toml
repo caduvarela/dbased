@@ -15,12 +15,16 @@ dbased-ui = { path = "crates/ui" }
 
 async-trait = "0.1"
 etcetera = "0.11"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 keyring-core = "1.0"
+secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 sqlparser = "0.64"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "mysql", "sqlite"] }
+testcontainers = "0.28"
 thiserror = "2"
-tokio = { version = "1.54", features = ["rt-multi-thread"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", default-features = false }
 toml = "1"
 tracing = "0.1"
 
