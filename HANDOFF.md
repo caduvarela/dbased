@@ -11,22 +11,22 @@ Branch topology (each line is "based on"):
   - `feat/core-service-skeleton` (dispatcher, ConnectionStore TOML, SecretStore trait, error mapping, shutdown)
     - `feat/core-execution` (tab actors, statement execution, result store, `dbased-sql::statement_at`)
       - `fix/early-columns` (Postgres sends Columns before the statement runs, outside transactions)
-      - `feat/csv-export` (IN PROGRESS, see below)
+      - `feat/csv-export` (done, not merged, see below)
     - `feat/keychain-store` (keyring-backed SecretStore)
   - `feat/fake-core` (FakeCore in `commands`, feature `fake`)
     - `feat/ui-shell` (dock, explorer, editor tabs, results grid, 69 tests)
       - `feat/ui-connections` (connection dialog, password prompt, delete confirm)
 - `feat/app-wiring` = integration branch: merges keychain, ui-shell/fake-core, ui-connections, early-columns on top of core-execution; real Core wired in `crates/app` (bounded 12 s shutdown); contract tests run the same scenarios against FakeCore and the real Core. **This is the best branch to build and run.**
-  - `fix/execution-review` (IN PROGRESS: fixes for the Opus review of core-execution, see below)
-- `feat/mysql-driver` (IN PROGRESS, based on an older commit `ad515c0`; merge or rebase later)
+  - `fix/execution-review` (merged into this branch)
+- `feat/mysql-driver` (done, not merged; based on an older commit `ad515c0`)
 
-## In progress when this was written (agents may have finished: check `git log` on each branch)
-- `fix/execution-review`: 8 findings from the review of `feat/core-execution`: script continuing on a fresh session after a mid-script close (data-integrity risk), cancel during auto-connect, panics in spawned tasks leaving tabs stuck, Connect terminal event during shutdown, empty-script validation before connecting, aborted-statement result completeness, ReleaseResult before create, TabId reuse guard.
-- `feat/csv-export`: DONE, pushed. Core-only CSV export (3.3), no UI yet. Rows end with LF (RFC 4180 says CRLF: one constant in the encoder).
-- `feat/mysql-driver`: DONE, pushed (34 integration tests). Open decision: enable sqlx `mysql-rsa` so TLS Disable/Prefer-plaintext works with `caching_sha2_password` (pulls in the `rsa` crate). Not yet wired into `DefaultConnector`; branch is based on old `ad515c0`, merge into the integration branch.
+## Status of the side branches (2026-11-15, end of session)
+- `fix/execution-review`: DONE and MERGED into `feat/app-wiring` (all 8 review findings fixed, 13 new tests, integration suite green twice). Choices: cancel before start ends as `ExecutionStarted` then `ExecutionFinished(Cancelled{0})`; bad `Selection` range maps to `ErrorKind::Configuration`; Disconnect while connecting still returns `Internal`.
+- `feat/csv-export`: DONE (Core only), pushed, NOT yet merged. Merging it into `feat/app-wiring` conflicts in `service/dispatcher.rs`, `service/mod.rs` and `service/tests_session.rs` (the review fixes reworked the dispatcher). Resolve by hand: keep the review-fix structure (task-id role map, plan before claiming the slot) and re-add the export registry, `ExportCsv`/`CancelExport` handling and export shutdown/disconnect cancellation.
+- `feat/mysql-driver`: DONE (34 integration tests), pushed, NOT yet merged (also based on the old commit `ad515c0`; expect conflicts in `drivers/mod.rs`, `tests/support/mod.rs`, workspace manifests). Not wired into `DefaultConnector`.
 
 ## Next steps (suggested order)
-1. Finish and merge the three in-progress branches into `feat/app-wiring` (or a successor integration branch). Merge `fix/execution-review` first.
+1. Merge `feat/csv-export`, then `feat/mysql-driver`, into `feat/app-wiring` (conflicts described above), then re-run fmt, clippy (also with `-p dbased-core --features integration`) and both test suites.
 2. Record in `docs/PROJECT.md` (11.2/3.2.4) the deviations found by the review: dispatcher claims the running slot (not the actor); `Disconnected` is emitted before sessions finish closing; planning/EmptyScript moves to the dispatcher; `ResultBuffer` holds rows only; `StatementSpan.index` counts within the plan; MySQL `Selection` loses a `DELIMITER` above the selection; cancel-before-start terminal event choice.
 3. Wire the MySQL driver into `DefaultConnector` (currently `NotImplemented`), `list_routines` for both drivers.
 4. UI: CSV export action, simple row editing (2.6), command palette, global search, editor error underline from `DatabaseError.position`, layout persistence.
