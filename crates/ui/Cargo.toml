@@ -1,0 +1,15 @@
+[package]
+name = "dbased-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dbased-commands.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-platform.workspace = true
+
+[lints]
+workspace = true
