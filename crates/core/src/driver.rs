@@ -165,6 +165,9 @@ pub trait Driver: Send + Sync {
     async fn list_views(&self, schema: &str) -> Result<Vec<ViewRef>, CoreError>;
     async fn list_routines(&self, schema: &str) -> Result<Vec<Routine>, CoreError>;
 
+    /// Closes the pool. Callers close every session first: cancels use the pool (2.2).
+    async fn close(&self);
+
     fn quote_identifier(&self, identifier: &str) -> String;
     fn paginate(&self, base_sql: &str, page: PageRequest) -> String;
     // @TODO: `rewrite_parameters` (2.1) arrives with the tokenizer and parameters (2.7, 9.3).

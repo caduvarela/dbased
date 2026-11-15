@@ -37,6 +37,22 @@ pub enum CoreError {
     NotImplemented(&'static str),
     #[error("operation not supported by this driver: {0}")]
     Unsupported(&'static str),
+    #[error("a password is required")]
+    PasswordRequired,
+    #[error("unknown connection")]
+    UnknownConnection,
+    #[error("unknown tab")]
+    UnknownTab,
+    #[error("the tab is already running a statement")]
+    TabBusy,
+    #[error("there is no statement to run")]
+    EmptyScript,
+    #[error("storage failure: {0}")]
+    Storage(String),
+    #[error("secret store failure: {0}")]
+    SecretStore(String),
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 impl CoreError {
@@ -54,6 +70,14 @@ impl CoreError {
             Self::CancelFailed(_) => "cancel_failed",
             Self::NotImplemented(_) => "not_implemented",
             Self::Unsupported(_) => "unsupported",
+            Self::PasswordRequired => "password_required",
+            Self::UnknownConnection => "unknown_connection",
+            Self::UnknownTab => "unknown_tab",
+            Self::TabBusy => "tab_busy",
+            Self::EmptyScript => "empty_script",
+            Self::Storage(_) => "storage",
+            Self::SecretStore(_) => "secret_store",
+            Self::Internal(_) => "internal",
         }
     }
 }

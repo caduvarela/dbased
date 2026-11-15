@@ -8,14 +8,18 @@ publish.workspace = true
 [dependencies]
 dbased-commands.workspace = true
 async-trait.workspace = true
+etcetera.workspace = true
 futures-util.workspace = true
 secrecy.workspace = true
+serde.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 testcontainers.workspace = true
 
 [features]

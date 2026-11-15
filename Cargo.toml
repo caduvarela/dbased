@@ -23,6 +23,7 @@ secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 sqlparser = "0.64"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "mysql", "sqlite"] }
+tempfile = "3"
 testcontainers = "0.28"
 thiserror = "2"
 tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "macros"] }

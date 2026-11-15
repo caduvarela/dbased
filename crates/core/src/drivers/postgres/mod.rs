@@ -134,6 +134,10 @@ impl Driver for PostgresDriver {
         Err(CoreError::NotImplemented("listing routines"))
     }
 
+    async fn close(&self) {
+        self.pool.close().await;
+    }
+
     fn quote_identifier(&self, identifier: &str) -> String {
         quote_identifier(identifier)
     }
