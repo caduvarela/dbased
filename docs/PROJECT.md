@@ -2046,7 +2046,8 @@ and one database per test. The tokenizer and parser layers (2.7) use
 table-driven tests (`rstest`) and snapshot tests (`insta`). Tooling: `cargo
 nextest` for test runs (plus `cargo test --doc`), `cargo deny` for licenses,
 advisories and sources, and `cargo machete` for unused dependencies. The `app`
-crate stays thin enough to need almost no tests. No test touches the UI.
+crate stays thin enough to need almost no tests. The Core never needs a UI to be
+tested; the UI has its own automated layers (7.1), kept apart from the Core's.
 
 **Why.** Fulfills "the Rust Core must be testable without any UI". The mock
 driver tests the engine logic; testcontainers tests the real driver impls; the
@@ -2082,6 +2083,66 @@ CI, and are slower than tests against an already-running database because
 containers must start (reusing one container per binary limits this). Keeping both
 testcontainers and a development compose file means image versions live in two
 places; the single declaration in item 2 prevents drift.
+
+### 7.1 UI testing *(new 2026-11)*
+
+**Decision.** The UI is tested automatically in layers, all in `crates/ui` (and
+`crates/app` where needed), none touching a real database (a fake command/event
+channel stands in for the Core, 0.2):
+
+1. **Logic, no UI.** Core and `commands` tests (above). SQL lexing, command
+   dispatch and result formatting stay free of GPUI.
+2. **Interaction tests, no display or GPU.** `#[gpui::test]` with
+   `TestAppContext` / `VisualTestContext`: simulated keystrokes and clicks,
+   actions, focus, keybindings, layout bounds (`debug_bounds`), deterministic
+   time (`run_until_parked`, `advance_clock`), and state of the Table, Dock and
+   editor. One shared `launch()` helper initializes `gpui_component::init`,
+   fonts, theme and keybindings and wraps the view in `gpui_component::Root`.
+   Structure dumps (the Dock layout dump, accessibility info per element) use
+   `insta` text snapshots.
+3. **Visual snapshot tests, no display server.** `gpui::HeadlessAppContext` with
+   the headless renderer (wgpu/Vulkan on Linux, Metal on macOS) and
+   `capture_screenshot`, which returns an image. It needs a Vulkan device (a real
+   GPU or the lavapipe software driver) but no X11 or Wayland. Rules: one fixed
+   window size per case, one theme per case, a **bundled font** (system fonts are
+   the main source of drift between machines), and the real asset source so icons
+   render. Baselines live in `tests/visual/baselines/<os>/` (Linux and macOS
+   never share baselines: different text rendering), compare per channel with a
+   small tolerance and a match threshold (start from Zed's 2 and 99%), write
+   `*_actual.png` and `*_diff.png` on failure, and regenerate with
+   `UPDATE_BASELINE=1`. Visual tests run with `--test-threads=1` because the wgpu
+   device is process-wide, and fail with a clear message, never silently skip,
+   when no Vulkan device exists.
+4. **Optional end-to-end on a real display (local only).** Launch the app, drive
+   it with `xdotool` (X11) or `ydotool` (Wayland), capture with `import`, `grim`
+   or a desktop-portal screenshot, compare loosely. Fragile and compositor
+   dependent, so never required in CI.
+
+Not adopted: Zed's own visual runner and `VisualTestAppContext` (macOS only), and
+the `gpui-mcp` bridge (needs a patched GPUI; revisit only if it supports the
+pinned snapshot).
+
+Dev-dependencies (added when the first UI test exists, not before, to respect the
+no-unused-dependencies rule): `gpui`, `gpui-component` and `gpui-pre-platform`
+with their `test-support` features, `gpui-pre-wgpu` (exact pin, centralized in
+`[workspace.dependencies]`), `image`, and optionally `image-compare` and `insta`.
+CI on Linux installs `mesa-vulkan-drivers` and `libvulkan1` (software Vulkan);
+macOS runs its own Metal baselines.
+
+**Why.** The maintainers develop on machines with a display, so visual
+regressions should be caught automatically instead of by eye. Headless rendering
+gives deterministic, compositor-independent images, which the optional layer 4
+cannot. The first two layers cover most behavior at low cost and without a GPU.
+Serves Maintainability and UX.
+
+**Trade-off.** The headless path does not capture window chrome or the compositor.
+Baselines are per OS and need a tolerance, and the visual layer depends on a
+Vulkan device and on a bundled font. In one scene, a real GPU and lavapipe gave
+identical pixels; shadows, blur and gradients were not checked, so expect to
+tune tolerance and to re-baseline after wgpu or driver upgrades. The a11y tree is
+inactive in tests, so only per-element accessibility info can be asserted. GitHub
+runner behavior (GPU and ICD availability) is unverified and must be confirmed
+when CI is set up.
 
 ---
 
