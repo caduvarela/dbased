@@ -2438,9 +2438,9 @@ upstream API.
 **Decision.** Add cursor above / below (Ctrl+Alt+Up/Down) is context-aware by
 default, through DBased's own `SmartAddCursorAbove` / `SmartAddCursorBelow`
 actions. A setting `smart_multicursor` (default `true`) turns it off, which
-routes the binding back to the upstream actions. The base algorithm is a port
-of the VS Code extension Smart Multi Cursor (`idanpa/vscode-smartmulticursor`,
-MIT, Copyright (c) 2022 Idan Pazi; about 100 lines):
+routes the binding back to the upstream actions. The behavior is inspired by
+the VS Code extension Smart Multi Cursor (`idanpa/vscode-smartmulticursor`)
+and reimplemented independently in DBased:
 
 1. Take the last cursor (the first one for "above") and look at the
    character just before or just after it, allowing one adjacent space.
@@ -2464,9 +2464,10 @@ The scanner lives in `core`, which `ui` must not depend on (1.3), and a cursor
 action cannot wait on a Command round trip. When this is built, the scanner
 moves into a small pure crate (`dbased-sql`: no I/O, no async, no GPUI) used
 by both `core` and `ui`, so there is still exactly one lexer (2.7). It also
-needs the upstream selection getter and line helpers (OPEN-6). If code is
-ported rather than reimplemented, the file keeps the original MIT copyright
-notice and the project's third-party notices list it.
+needs the upstream selection getter and line helpers (OPEN-6). No code is
+taken from the extension, so no licence obligation applies; crediting it as
+inspiration is a courtesy. If code from it were ever copied or translated, its
+MIT copyright notice must be kept, in the same commit.
 
 **Why.** Column-shaped SQL (`INSERT ... VALUES` rows, column lists, `CASE`
 branches, aligned `=` in `SET`) has lines of different lengths, where plain
