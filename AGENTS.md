@@ -19,14 +19,15 @@ Durable decisions go in `docs/PROJECT.md`, never only in `HANDOFF.md`. Update `H
 
 ```
 crates/commands  dbased-commands  Command/Event enums and shared DTOs (the contract)
-crates/core      dbased-core      business logic, sqlx drivers, jobs, cache, tokenizer
+crates/sql       dbased-sql       pure SQL scanner, statement splitter, parameter finder (no deps)
+crates/core      dbased-core      business logic, sqlx drivers, jobs, cache
 crates/ui        dbased-ui        GPUI + gpui-component, depends only on `commands`
 crates/app       dbased-app       binary `dbased`, wires core and ui
 ```
 
 Hard rules (enforced by the compiler and checked with `cargo tree`):
 
-- `core` never imports `gpui` or `gpui-component`. `ui` never depends on `core`.
+- `core` never imports `gpui` or `gpui-component`. `ui` never depends on `core`. `sql` depends on nothing.
 - UI and Core talk only through `Command`/`Event` values from `commands`.
 - tokio and sqlx stay inside `core` (and `app` for starting the runtime).
 - Pin every `gpui-*` crate with an exact `=x.y.z`. Upgrade deliberately, on its own branch.
