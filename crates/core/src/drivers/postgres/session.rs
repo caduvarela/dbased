@@ -33,6 +33,17 @@ pub(super) struct SessionSettings {
 }
 
 impl SessionSettings {
+    /// The same settings without result caps, for exports (docs/PROJECT.md 3.3).
+    pub(super) fn unlimited(&self) -> Self {
+        Self {
+            limits: SessionLimits {
+                max_rows: u64::MAX,
+                max_bytes: usize::MAX,
+            },
+            ..self.clone()
+        }
+    }
+
     pub(super) fn from_config(config: &PostgresConfig) -> Self {
         Self {
             limits: config.limits,

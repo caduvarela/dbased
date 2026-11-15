@@ -159,6 +159,10 @@ pub trait Driver: Send + Sync {
     /// Opens a dedicated session (one physical connection, outside the pool) (2.2).
     async fn open_session(&self) -> Result<Box<dyn Session>, CoreError>;
 
+    /// Like `open_session`, but without the row and memory caps of 2.3: export is the one
+    /// operation that must see the whole result (3.3).
+    async fn open_export_session(&self) -> Result<Box<dyn Session>, CoreError>;
+
     async fn list_schemas(&self) -> Result<Vec<Schema>, CoreError>;
     async fn list_tables(&self, schema: &str) -> Result<Vec<TableRef>, CoreError>;
     async fn list_columns(&self, table: &TableRef) -> Result<Vec<Column>, CoreError>;

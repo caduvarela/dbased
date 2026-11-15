@@ -88,9 +88,8 @@ impl DriverFactory for PostgresDriver {
     }
 }
 
-#[async_trait]
-impl Driver for PostgresDriver {
-    async fn open_session(&self) -> Result<Box<dyn Session>, CoreError> {
+impl PostgresDriver {
+    async fn open_with(&self, settings: SessionSettings) -> Result<Box<dyn Session>, CoreError> {
         // @NOTE: sessions are opened outside the pool so session state never leaks into pooled work.
         let options = self.options.clone().statement_cache_capacity(0);
         let mut connection = PgConnection::connect_with(&options)
@@ -108,12 +107,22 @@ impl Driver for PostgresDriver {
             session_id,
             connection,
             CancelHandle::new(session_id, self.canceller.clone()),
-            self.settings.clone(),
+            settings,
             self.type_names.clone(),
             self.pool.clone(),
         )))
     }
+}
 
+#[async_trait]
+impl Driver for PostgresDriver {
+    async fn open_session(&self) -> Result<Box<dyn Session>, CoreError> {
+        self.open_with(self.settings.clone()).await
+    }
+
+    async fn open_export_session(&self) -> Result<Box<dyn Session>, CoreError> {
+        self.open_with(self.settings.unlimited()).await
+    }
     async fn list_schemas(&self) -> Result<Vec<Schema>, CoreError> {
         metadata::list_schemas(&self.pool).await
     }
