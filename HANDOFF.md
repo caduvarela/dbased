@@ -1,38 +1,51 @@
 # Handoff
 
-## Done
-- Workspace skeleton: `dbased-commands`, `dbased-core`, `dbased-ui`, `dbased-app` (binary `dbased`); fmt, clippy, build pass. `etcetera` and the `keyring-core` stores are in the manifest.
-- Dev compose (`compose.yaml`, `.env`, `dev/seed/`, `dev/README.md`): Postgres 17 and MySQL 8.4 with seeded data incl. a 1M-row table.
-- Week-one spike (items 1-8) and the 2026-11 human tests on X11/MATE folded into `docs/PROJECT.md` (Part 10, 6.1, 7.1). Spike code lives outside the repo in `../dbased-spike`. Gate passed for starting the real UI.
-- Recorded as Later (not next): VS Code-like default keymap, VS Code Windows mapping confirmed (9.4), smart multi-cursor (9.4.1), step-by-step debug mode (9.5), SQL formatting with portable styles (9.6), explain visualization (9.7), own emoji/symbol picker (6.1).
+Updated 2026-11-15. Read `docs/PROJECT.md` first (Part A constitution, Part B decisions; Parts 10 and 11 are the freshest). This file must never reach `master`.
 
-## In progress
-- Nothing.
+## Where the code stands
 
-## Next step
-- Core service (Part 11): spec written and the six product calls decided. Implement per 11.5, starting with PR 1 (the contract in `commands`).
-- `dbased-sql` crate done (cbd22cd..1649306): scanner, statement splitter, parameter finder; not wired into core yet. Wire the splitter into the Core execution path (9.2) so multi-statement strings never reach `raw_sql`, then `rewrite_parameters`.
-- Postgres driver slice is done and reviewed (commits up to a709f08). Decisions taken (3.2.4): drain-not-cancel inside user transactions; cancel handle tied to a live session. Both implemented (6d66a6f, 0c672dd); 33 integration tests.
-- First real driver (Postgres): the 2.1 trait (Session / Canceller, `UserSql`, `health_check`), the `AssertSqlSafe` invariant in the `UserSql` conversion (1.2, rule 1), the 3.2 cancel policy with integration tests (clean cancel, late cancel, aborted transaction, drain timeout).
-- In parallel or next: real UI shell in `crates/ui` (Dock with explorer / editor / bottom result tabs, grid against a fake Core source) following the 6.3 grid rules; the editor takes focus on open and tab activation (6.1). Add `tree-sitter-sql` and `gpui-base =0.9.1` to `ui` only when first used.
-- Not next: the keymap commands, smart multi-cursor and the Later features above.
+Stacked PRs already open on GitHub (HANDOFF-free copies of history): #1 scaffold + docs, #2 Postgres driver, #3 `dbased-sql`. Everything below is newer, local-history work on feature branches (not in those PRs yet).
 
-## Pending manual checks (Part 10 gate status)
-- CJK composition with a real input method (XIM on X11: `XMODIFIERS` plus ibus/fcitx5).
-- Items 1-5 on Wayland; grid on lower-end hardware and under GPU contention.
-- Startup with dropped caches (cold).
+Branch topology (each line is "based on"):
+- `feat/core-contract` (Part 11 spec, contract in `commands`, dev profile tweak)
+  - `feat/core-service-skeleton` (dispatcher, ConnectionStore TOML, SecretStore trait, error mapping, shutdown)
+    - `feat/core-execution` (tab actors, statement execution, result store, `dbased-sql::statement_at`)
+      - `fix/early-columns` (Postgres sends Columns before the statement runs, outside transactions)
+      - `feat/csv-export` (IN PROGRESS, see below)
+    - `feat/keychain-store` (keyring-backed SecretStore)
+  - `feat/fake-core` (FakeCore in `commands`, feature `fake`)
+    - `feat/ui-shell` (dock, explorer, editor tabs, results grid, 69 tests)
+      - `feat/ui-connections` (connection dialog, password prompt, delete confirm)
+- `feat/app-wiring` = integration branch: merges keychain, ui-shell/fake-core, ui-connections, early-columns on top of core-execution; real Core wired in `crates/app` (bounded 12 s shutdown); contract tests run the same scenarios against FakeCore and the real Core. **This is the best branch to build and run.**
+  - `fix/execution-review` (IN PROGRESS: fixes for the Opus review of core-execution, see below)
+- `feat/mysql-driver` (IN PROGRESS, based on an older commit `ad515c0`; merge or rebase later)
 
-## Re-verify before relying on it
-- Grid 60 fps on a quiet machine: the persisted spike logs only contain the 33 ms contention runs; record a clean run.
-- Editor RSS growth (127 -> ~295-385 MB on 100K lines): one-time or per-edit?
-- Dropped-future and cancel behavior on the extended protocol / `prepare` / sqlx `begin()`.
-- MySQL zero-date in the binary protocol: `is_null()` true, or empty bytes?
-- Keyring calls from `spawn_blocking` inside the Core runtime; TLS `verify-ca` / `verify-full` against real roots.
-- Tokenizer matrix additions in 2.7.
-- An input method that uses `Ctrl+.` sees the key before the app (XIM, Wayland); `Ctrl+.` stays upstream code actions.
-- Upstream Ctrl+Alt+click (no drag) adds a cursor on Linux; MySQL 8.4 JSON output for `EXPLAIN ANALYZE`.
+## In progress when this was written (agents may have finished: check `git log` on each branch)
+- `fix/execution-review`: 8 findings from the review of `feat/core-execution`: script continuing on a fresh session after a mid-script close (data-integrity risk), cancel during auto-connect, panics in spawned tasks leaving tabs stuck, Connect terminal event during shutdown, empty-script validation before connecting, aborted-statement result completeness, ReleaseResult before create, TabId reuse guard.
+- `feat/csv-export`: Core-only CSV export (3.3), no UI yet.
+- `feat/mysql-driver`: MySQL driver mirroring the Postgres one (KILL QUERY cancel, transaction tracking).
+
+## Next steps (suggested order)
+1. Finish and merge the three in-progress branches into `feat/app-wiring` (or a successor integration branch). Merge `fix/execution-review` first.
+2. Record in `docs/PROJECT.md` (11.2/3.2.4) the deviations found by the review: dispatcher claims the running slot (not the actor); `Disconnected` is emitted before sessions finish closing; planning/EmptyScript moves to the dispatcher; `ResultBuffer` holds rows only; `StatementSpan.index` counts within the plan; MySQL `Selection` loses a `DELIMITER` above the selection; cancel-before-start terminal event choice.
+3. Wire the MySQL driver into `DefaultConnector` (currently `NotImplemented`), `list_routines` for both drivers.
+4. UI: CSV export action, simple row editing (2.6), command palette, global search, editor error underline from `DatabaseError.position`, layout persistence.
+5. Manual end-to-end run (`docker compose up -d`, then `cargo run -p dbased-app` on `feat/app-wiring`): connect, run a script, cancel, quit cleanly. Not yet done by a human.
+6. Open the next round of stacked PRs (contract, fake core, skeleton, execution, keychain, UI shell, connections, wiring, MySQL, CSV) once reviewed. Remember: PR branches must exclude `HANDOFF.md` (filter it out of a copy of the history; remote `chore/workspace-scaffold` still contains it and should not be merged).
+
+## Known issues / follow-ups
+- Flaky timing test `a_row_cap_outside_a_transaction_still_cancels_after_commit_and_rollback` (10 s bound under load): loosen to 30 s.
+- `Execute` for a PasswordRequired connection is only tested at logic level in the UI (FakeCore never returns it).
+- macOS, Windows and KWallet keyring paths were never compiled or tested.
+- Pending manual checks (Part 10): CJK composition with a real input method, Wayland, lower-end hardware, cold startup, clean 60 fps grid run recorded, editor RSS growth.
+
+## Environment notes
+- Rust toolchain pinned in `rust-toolchain.toml`; `source ~/.cargo/env` if cargo is not in PATH. Linux build needs the apt `-dev` packages listed in `AGENTS.md`.
+- `target/` can reach 15+ GB. Dev profile now uses `debug = "line-tables-only"` and no debug info for dependencies. `cargo-sweep` is installed locally (`cargo sweep --stamp`, rebuild, `cargo sweep --file`). Parallel worktrees should share one `CARGO_TARGET_DIR`; if cargo reports a stale "unresolved import", touch the crate's `lib.rs`.
+- Dev databases: `docker compose up -d` (Postgres 17 on 54320, MySQL 8.4 on 33060, credentials `dbased`/`dbased`). Integration tests use testcontainers behind the `integration` feature and never touch these.
+- Agent workflow used so far: Sonnet subagents implement in git worktrees under `../dbased-wt/<name>`; Opus agents design and review. Commits are single-line Conventional Commits, no body, no trailers. Never push or open PRs unprompted.
 
 ## Open questions (user)
-- (Resolved 2026-11: `Ctrl+.` stays code actions; `dbased-sql` crate approved.)
 - Names and contents of the 3-4 formatting presets (9.6).
-- `sqlparser`, `toml`, `serde`-in-core are declared but unused; `unused_dependencies` lint is allowed workspace-wide until ui/app use their declared deps.
+- Run shortcuts chosen by the UI agent (Ctrl+Enter runs selection/current, Ctrl+Shift+Enter runs all): confirm.
+- `sqlparser`, `toml` and similar unused workspace deps remain declared; the `unused_dependencies` lint is allowed workspace-wide.
