@@ -88,6 +88,8 @@ reasoning kept, rather than deleted.
   - Fragment debugging grows into a step-by-step debug mode with a block
     tree, per-step row counts and read-only safety (9.5).
   - New: SQL formatting with portable, deterministic style files (9.6).
+  - New: explain visualization over a common plan model, with rollback and
+    confirmation for `EXPLAIN ANALYZE` of non-reads (9.7).
 
 ---
 
@@ -2595,6 +2597,52 @@ SQL), and fits Core Independence (the engine runs without a UI).
 maintain, and correctness risk (a formatter must never change meaning; the
 token check guards it). Scope creep is the main danger, so the rule set stays
 small and compatibility with other tools waits.
+
+### 9.7 Explain visualization (Later) *(new 2026-11)*
+
+This is the Constitution's "Explain Visual" future feature (Part A, Future
+Features), worked out here.
+
+**Decision (future).** Show query plans, including `EXPLAIN ANALYZE`, in a
+summarized and a detailed view.
+
+- **Sources.** Postgres: `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`, or
+  `EXPLAIN (FORMAT JSON)` without executing. MySQL: `EXPLAIN FORMAT=JSON`
+  for a plain plan and `EXPLAIN ANALYZE` (tree text) for actuals; whether
+  MySQL 8.4 offers JSON output for `ANALYZE` is to be verified, and is
+  preferred if so.
+- **Common plan model.** The formats differ greatly, so the Core parses each
+  into one model (like the Value model, 2.5): a tree of nodes with operation,
+  relation, estimated and actual rows, loops, time (total and self), buffers
+  and cost, plus the raw fields it does not model. The UI sees only this
+  model; the raw plan text stays one click away.
+- **Two views.** *Summary*: the slowest nodes by self time, sequential scans
+  on large tables, sorts and hashes spilling to disk, large estimate-versus-actual
+  divergence, nested loops with many iterations. *Detail*: the full tree with
+  the bottleneck highlighted.
+- **Safety.** `EXPLAIN ANALYZE` **executes** the statement. A pure read (AST
+  classification, 2.7) runs as is, with a warning that it runs to completion
+  and can be costly. Anything else, including anything that does not parse,
+  needs explicit confirmation and runs inside a transaction that is rolled
+  back. The confirmation says that a rollback cannot undo non-transactional
+  effects (sequences, MySQL non-transactional tables, external side effects
+  of functions). If the tab's session is inside a user transaction, a
+  non-read is refused. It runs on the tab's session as a cancellable job
+  (3.1, 3.2); parameters (9.3) are bound as usual.
+- Ideas, not code, come from pev2, explain.dalibo.com and explain.depesz.com.
+
+Phasing: (1) plain and analyzed plans with the slowest node highlighted; (2)
+summary and detail views; (3) per-step plans inside the debug mode (9.5).
+
+**Why.** Raw `EXPLAIN ANALYZE` output is hard to read, and the common question
+is "which node is slow, and why". A model in the Core keeps both databases
+behind one view and keeps the analysis testable without a UI. Serves UX and
+Hidden Power.
+
+**Trade-off.** Two plan parsers to maintain against changing server output
+(unmodeled fields are kept raw, never an error). Executing a statement to
+explain it is inherently risky; the rollback, the confirmation and the honest
+warning bound that risk without hiding it.
 
 ---
 
