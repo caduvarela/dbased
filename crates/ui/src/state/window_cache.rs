@@ -45,6 +45,7 @@ impl WindowCache {
         self.total_rows
     }
 
+    #[cfg(test)]
     pub fn cached_windows(&self) -> usize {
         self.windows.len()
     }
@@ -293,7 +294,12 @@ mod tests {
         cache.visible_changed(0..30);
         cache.apply_window(0, rows(0, 200));
         cache.apply_window(200, rows(200, 200));
-        assert!(cache.set_total_rows(900).iter().all(|request| request.start >= 400));
+        assert!(
+            cache
+                .set_total_rows(900)
+                .iter()
+                .all(|request| request.start >= 400)
+        );
     }
 
     #[test]

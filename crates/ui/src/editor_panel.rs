@@ -1,7 +1,7 @@
 use dbased_commands::{ConnectionId, ExecuteTarget, TabId};
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window, div, px,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Sizable as _,
@@ -69,14 +69,12 @@ impl EditorPanel {
         self.tab = tab;
     }
 
+    #[cfg(test)]
     pub fn editor(&self) -> &Entity<EditorState> {
         &self.editor
     }
 
-    pub fn text(&self, cx: &App) -> String {
-        self.editor.read(cx).value().to_string()
-    }
-
+    #[cfg(test)]
     pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let text = text.to_string();
         self.editor
@@ -85,9 +83,11 @@ impl EditorPanel {
 
     /// Docs/PROJECT.md 6.1: the editor takes keyboard focus when its tab opens or activates.
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
-        self.editor.update(cx, |editor, cx| editor.focus(window, cx));
+        self.editor
+            .update(cx, |editor, cx| editor.focus(window, cx));
     }
 
+    #[cfg(test)]
     pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
         self.editor.read(cx).focus_handle(cx).is_focused(window)
     }
@@ -121,7 +121,10 @@ impl EditorPanel {
             Some(tab) => state.connections.name(tab.connection),
             None => "No connection".to_string(),
         };
-        let busy = state.tabs.get(self.tab).is_some_and(|tab| tab.activity.is_busy());
+        let busy = state
+            .tabs
+            .get(self.tab)
+            .is_some_and(|tab| tab.activity.is_busy());
         let current = state.tabs.get(self.tab).map(|tab| tab.connection);
         let panel = cx.weak_entity();
         let app_state = self.state.clone();
@@ -254,12 +257,7 @@ impl Render for EditorPanel {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(picker)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(status_color)
-                    .child(status_label),
-            )
+            .child(div().text_xs().text_color(status_color).child(status_label))
             .children(last_run.map(|label| {
                 div()
                     .text_xs()
@@ -277,4 +275,14 @@ impl Render for EditorPanel {
                     .child(Editor::new(&self.editor).size_full()),
             )
     }
+}
+
+#[cfg(test)]
+pub fn tab_title_for_tests(panel: &EditorPanel, cx: &App) -> Option<String> {
+    panel
+        .state
+        .read(cx)
+        .tabs
+        .get(panel.tab)
+        .map(|tab| tab.title.clone())
 }

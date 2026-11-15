@@ -1,10 +1,15 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use dbased_commands::{
     Command, ConnectionId, ExecuteTarget, MetadataNode, ResultId, ResultStatus, TabId,
     fake::FakeCore,
 };
 
 use super::*;
-use crate::state::{Activity, LastRun, NodeKey, TabStatus};
+use crate::state::{
+    NodeKey, TabStatus,
+    tabs::{Activity, LastRun},
+};
 
 /// Plays commands through the fake and feeds every event back into the state, the way the
 /// app does, until nothing is left to send.
@@ -47,7 +52,9 @@ impl Harness {
 
     fn execute(&mut self, script: &str) -> TabId {
         let tab = self.first_tab();
-        let commands = self.state.execute(tab, script.to_string(), ExecuteTarget::All);
+        let commands = self
+            .state
+            .execute(tab, script.to_string(), ExecuteTarget::All);
         self.run(commands);
         tab
     }
@@ -65,9 +72,11 @@ fn the_first_connection_list_opens_a_tab() {
 #[test]
 fn a_later_connection_list_does_not_open_more_tabs() {
     let mut harness = Harness::new();
-    let commands = harness.state.apply(dbased_commands::Event::ConnectionsChanged {
-        connections: harness.state.connections.items().to_vec(),
-    });
+    let commands = harness
+        .state
+        .apply(dbased_commands::Event::ConnectionsChanged {
+            connections: harness.state.connections.items().to_vec(),
+        });
     assert!(commands.is_empty());
     assert_eq!(harness.state.tabs.len(), 1);
 }
@@ -84,10 +93,7 @@ fn a_select_produces_a_finished_result_and_an_idle_tab() {
     assert_eq!(result.row_count(), 3);
     assert!(result.has_grid());
     assert_eq!(result.status(), Some(ResultStatus::Completed));
-    assert_eq!(
-        harness.state.tab_status(tab),
-        Some(TabStatus::Connected)
-    );
+    assert_eq!(harness.state.tab_status(tab), Some(TabStatus::Connected));
 }
 
 #[test]
@@ -111,7 +117,10 @@ fn a_failing_statement_stops_the_run_and_keeps_the_error() {
     let mut harness = Harness::new();
     let tab = harness.execute("select 1; fail; select 2");
     let model = harness.state.tabs.get(tab).expect("tab");
-    assert_eq!(model.last_run, Some(LastRun::StoppedOnError { statement: 1 }));
+    assert_eq!(
+        model.last_run,
+        Some(LastRun::StoppedOnError { statement: 1 })
+    );
     assert_eq!(model.results.len(), 2);
     let failed = harness.state.result(model.results[1]).expect("result");
     assert_eq!(failed.status(), Some(ResultStatus::Failed));
@@ -187,7 +196,9 @@ fn a_rejected_request_frees_the_tab_and_says_why() {
     let tab = harness.execute("   ");
     let model = harness.state.tabs.get(tab).expect("tab");
     assert_eq!(model.activity, Activity::Idle);
-    assert!(matches!(&model.last_run, Some(LastRun::Failed { message }) if message == "nothing to execute"));
+    assert!(
+        matches!(&model.last_run, Some(LastRun::Failed { message }) if message == "nothing to execute")
+    );
 }
 
 #[test]

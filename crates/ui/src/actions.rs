@@ -2,13 +2,7 @@ use gpui::{App, KeyBinding, actions};
 
 actions!(
     dbased,
-    [
-        RunCurrent,
-        RunAll,
-        CancelExecution,
-        NewTab,
-        CloseActiveTab
-    ]
+    [RunCurrent, RunAll, CancelExecution, NewTab, CloseActiveTab]
 );
 
 /// Key context of the workspace root.

@@ -63,7 +63,8 @@ impl ExplorerPanel {
         panel
     }
 
-    /// Ids of the rows currently in the tree, in display order (for tests and tooling).
+    /// Labels of the rows currently in the tree, in display order.
+    #[cfg(test)]
     pub fn visible_labels(&self, cx: &App) -> Vec<String> {
         let tree = self.tree.read(cx);
         (0..)
@@ -72,6 +73,7 @@ impl ExplorerPanel {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn tree(&self) -> &Entity<TreeState> {
         &self.tree
     }
@@ -232,12 +234,7 @@ impl Render for ExplorerPanel {
                 let mut line = h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .w(px(12.0))
-                            .text_color(glyph_color)
-                            .child(info.glyph),
-                    )
+                    .child(div().w(px(12.0)).text_color(glyph_color).child(info.glyph))
                     .child(
                         div()
                             .text_color(label_color)

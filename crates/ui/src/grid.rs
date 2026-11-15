@@ -45,6 +45,7 @@ impl GridDelegate {
         self.cache.total_rows()
     }
 
+    #[cfg(test)]
     pub fn cached_windows(&self) -> usize {
         self.cache.cached_windows()
     }
@@ -77,8 +78,7 @@ impl GridDelegate {
 }
 
 fn grid_column(meta: &ColumnMeta) -> Column {
-    let column = Column::new(meta.name.clone(), meta.name.clone())
-        .width(px(column_width(meta)));
+    let column = Column::new(meta.name.clone(), meta.name.clone()).width(px(column_width(meta)));
     if is_numeric_type(&meta.type_name) {
         column.text_right()
     } else {
@@ -137,10 +137,13 @@ impl TableDelegate for GridDelegate {
                 .child(SharedString::from(cell.text.clone())),
             CellLookup::Ready(cell) => div().child(SharedString::from(cell.text.clone())),
             CellLookup::Loading => div().child(
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .child(div().h(px(8.0)).w(px(48.0)).rounded_sm().bg(cx.theme().skeleton)),
+                h_flex().h_full().items_center().child(
+                    div()
+                        .h(px(8.0))
+                        .w(px(48.0))
+                        .rounded_sm()
+                        .bg(cx.theme().skeleton),
+                ),
             ),
         }
     }

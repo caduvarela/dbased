@@ -24,10 +24,6 @@ impl ResultModel {
         }
     }
 
-    pub fn is_running(&self) -> bool {
-        self.outcome.is_none()
-    }
-
     pub fn status(&self) -> Option<ResultStatus> {
         self.outcome.as_ref().map(|outcome| outcome.status)
     }
@@ -126,7 +122,7 @@ mod tests {
     fn a_running_result_follows_the_progress() {
         let mut result = model(2);
         result.rows_buffered = 1_500;
-        assert!(result.is_running());
+        assert!(result.outcome.is_none());
         assert_eq!(result.row_count(), 1_500);
         assert_eq!(result.status_line(), "Running... 1,500 rows");
     }

@@ -210,10 +210,12 @@ impl TabsModel {
         Some(previous)
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.tabs.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
@@ -250,8 +252,14 @@ mod tests {
         tabs.open(TabId(1), ConnectionId(1));
         tabs.open(TabId(2), ConnectionId(1));
         assert_eq!(tabs.active_id(), Some(TabId(2)));
-        assert_eq!(tabs.get(TabId(1)).map(|tab| tab.title.as_str()), Some("Query 1"));
-        assert_eq!(tabs.get(TabId(2)).map(|tab| tab.title.as_str()), Some("Query 2"));
+        assert_eq!(
+            tabs.get(TabId(1)).map(|tab| tab.title.as_str()),
+            Some("Query 1")
+        );
+        assert_eq!(
+            tabs.get(TabId(2)).map(|tab| tab.title.as_str()),
+            Some("Query 2")
+        );
     }
 
     #[test]
@@ -274,7 +282,11 @@ mod tests {
         let idle = Activity::Idle;
         let running = Activity::Running(RequestId(1));
         assert_eq!(
-            TabStatus::derive(idle, SessionState::NotOpen, Some(ConnectionState::Disconnected)),
+            TabStatus::derive(
+                idle,
+                SessionState::NotOpen,
+                Some(ConnectionState::Disconnected)
+            ),
             TabStatus::NotConnected
         );
         assert_eq!(
@@ -282,19 +294,23 @@ mod tests {
             TabStatus::Connected
         );
         assert_eq!(
-            TabStatus::derive(running, SessionState::Open, Some(ConnectionState::Connected)),
+            TabStatus::derive(
+                running,
+                SessionState::Open,
+                Some(ConnectionState::Connected)
+            ),
             TabStatus::Running
         );
         assert_eq!(
-            TabStatus::derive(running, SessionState::NotOpen, Some(ConnectionState::Connecting)),
+            TabStatus::derive(
+                running,
+                SessionState::NotOpen,
+                Some(ConnectionState::Connecting)
+            ),
             TabStatus::Connecting
         );
         assert_eq!(
-            TabStatus::derive(
-                Activity::Cancelling(RequestId(1)),
-                SessionState::Open,
-                None
-            ),
+            TabStatus::derive(Activity::Cancelling(RequestId(1)), SessionState::Open, None),
             TabStatus::Cancelling
         );
         assert_eq!(

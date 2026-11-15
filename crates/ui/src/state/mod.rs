@@ -9,10 +9,10 @@ mod tabs;
 mod ui_state;
 mod window_cache;
 
-pub use connections::{ConnectionsModel, kind_label};
-pub use explorer::{ExplorerModel, ExplorerNode, NodeKey, NodeKind};
-pub use format::{DisplayCell, format_count, is_numeric_type};
+pub use connections::kind_label;
+pub use explorer::{ExplorerNode, NodeKey, NodeKind};
+pub use format::is_numeric_type;
 pub use results::ResultModel;
-pub use tabs::{Activity, LastRun, TabModel, TabStatus, TabsModel};
+pub use tabs::TabStatus;
 pub use ui_state::{SendFailure, UiState};
 pub use window_cache::{CellLookup, FetchRequest, WindowCache};

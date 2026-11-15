@@ -54,6 +54,7 @@ impl ResultPanel {
         self.result
     }
 
+    #[cfg(test)]
     pub fn table(&self) -> Option<&Entity<TableState<GridDelegate>>> {
         self.table.as_ref()
     }
@@ -228,4 +229,62 @@ fn message_body(model: &ResultModel, cx: &App) -> impl IntoElement {
         body = body.child(SharedString::from(line));
     }
     body
+}
+
+/// Holds the bottom dock open, and says what goes there, while no result exists.
+pub struct ResultsPlaceholder {
+    focus_handle: FocusHandle,
+}
+
+impl ResultsPlaceholder {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl EventEmitter<PanelEvent> for ResultsPlaceholder {}
+
+impl Focusable for ResultsPlaceholder {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl BasePanel for ResultsPlaceholder {
+    fn panel_name(&self) -> &'static str {
+        "results-placeholder"
+    }
+
+    fn closable(&self, _cx: &App) -> bool {
+        false
+    }
+
+    fn zoomable(&self, _cx: &App) -> bool {
+        false
+    }
+}
+
+impl Panel for ResultsPlaceholder {
+    fn tab_name(&self, _cx: &App) -> Option<SharedString> {
+        Some("Results".into())
+    }
+
+    fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        "Results"
+    }
+}
+
+impl Render for ResultsPlaceholder {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(cx.theme().background)
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child("Run a statement to see its results here (Ctrl+Enter).")
+    }
 }

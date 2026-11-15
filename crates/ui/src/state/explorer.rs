@@ -67,11 +67,16 @@ impl NodeKey {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeKind {
-    Connection { database: DatabaseKind, state: ConnectionState },
+    Connection {
+        database: DatabaseKind,
+        state: ConnectionState,
+    },
     Schema,
     Table,
     View,
-    Column { nullable: bool },
+    Column {
+        nullable: bool,
+    },
     /// A row that is not data: "Loading...", "(empty)" or an error message.
     Placeholder,
 }
@@ -308,9 +313,7 @@ impl ExplorerModel {
 
 #[cfg(test)]
 mod tests {
-    use dbased_commands::{
-        ConnectionSettings, ConnectionSummary, ErrorKind, TlsMode,
-    };
+    use dbased_commands::{ConnectionSettings, ConnectionSummary, ErrorKind, TlsMode};
 
     use super::*;
 
@@ -344,7 +347,11 @@ mod tests {
     fn expanding_a_disconnected_connection_connects_then_loads() {
         let mut explorer = ExplorerModel::default();
         let mut ids = IdAllocator::default();
-        let commands = explorer.toggle(&NodeKey::Connection(ConnectionId(1)), &connections(), &mut ids);
+        let commands = explorer.toggle(
+            &NodeKey::Connection(ConnectionId(1)),
+            &connections(),
+            &mut ids,
+        );
         assert!(matches!(
             commands.as_slice(),
             [

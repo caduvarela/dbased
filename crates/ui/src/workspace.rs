@@ -2,9 +2,9 @@ use std::rc::Rc;
 
 use dbased_commands::{Command, ConnectionId, Event, ResultId, TabId, UiLink};
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, px,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Sizable as _,
@@ -21,7 +21,7 @@ use crate::{
     client::CommandSink,
     editor_panel::{EditorPanel, EditorPanelEvent, RunMode},
     explorer_panel::ExplorerPanel,
-    results_panel::ResultPanel,
+    results_panel::{ResultPanel, ResultsPlaceholder},
     state::UiState,
 };
 
@@ -34,7 +34,10 @@ pub struct Workspace {
     sink: CommandSink,
     dock: Entity<DockArea>,
     _dock_skin: Rc<DockSkin>,
+    #[cfg(test)]
     explorer: Entity<ExplorerPanel>,
+    placeholder: Entity<ResultsPlaceholder>,
+    placeholder_shown: bool,
     editors: Vec<Entity<EditorPanel>>,
     results: Vec<Entity<ResultPanel>>,
     focus_handle: FocusHandle,
@@ -59,6 +62,16 @@ impl Workspace {
                 cx,
             );
         });
+        let placeholder = cx.new(ResultsPlaceholder::new);
+        dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                panel_handle(placeholder.clone()),
+                DockPlacement::Bottom,
+                Some(px(RESULTS_HEIGHT)),
+                window,
+                cx,
+            );
+        });
         let observe_state = cx.observe_in(&state, window, |workspace, _, window, cx| {
             workspace.sync_panels(window, cx);
             cx.notify();
@@ -68,7 +81,10 @@ impl Workspace {
             sink,
             dock,
             _dock_skin: skin,
+            #[cfg(test)]
             explorer,
+            placeholder,
+            placeholder_shown: true,
             editors: Vec::new(),
             results: Vec::new(),
             focus_handle: cx.focus_handle(),
@@ -78,16 +94,19 @@ impl Workspace {
         workspace
     }
 
+    #[cfg(test)]
     pub fn state(&self) -> &Entity<UiState> {
         &self.state
     }
 
+    #[cfg(test)]
     pub fn explorer(&self) -> &Entity<ExplorerPanel> {
         &self.explorer
     }
 
-    pub fn dock(&self) -> &Entity<DockArea> {
-        &self.dock
+    #[cfg(test)]
+    pub fn placeholder_shown(&self) -> bool {
+        self.placeholder_shown
     }
 
     pub fn editor_for(&self, tab: TabId, cx: &App) -> Option<Entity<EditorPanel>> {
@@ -120,7 +139,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 let Ok(first) = events.recv().await else {
-                    this.update(cx, |workspace, cx| workspace.core_stopped(cx)).ok();
+                    this.update(cx, |workspace, cx| workspace.core_stopped(cx))
+                        .ok();
                     return;
                 };
                 let mut batch = vec![first];
@@ -145,7 +165,12 @@ impl Workspace {
         });
     }
 
-    pub fn apply_events(&mut self, events: Vec<Event>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn apply_events(
+        &mut self,
+        events: Vec<Event>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut commands = Vec::new();
         for event in events {
             if let Event::RowsWindow {
@@ -257,12 +282,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let tab = panel.read(cx).tab();
-        let rebound = self
-            .state
-            .update(cx, |state, cx| {
-                cx.notify();
-                state.rebind_tab(tab, connection)
-            });
+        let rebound = self.state.update(cx, |state, cx| {
+            cx.notify();
+            state.rebind_tab(tab, connection)
+        });
         let Some((fresh, commands)) = rebound else {
             return;
         };
@@ -295,6 +318,9 @@ impl Workspace {
             self.dock
                 .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
         }
+        if !wanted.is_empty() {
+            self.set_placeholder(false, window, cx);
+        }
         for result in wanted {
             if self.result_panel(result, cx).is_some() {
                 continue;
@@ -313,6 +339,30 @@ impl Workspace {
                 );
             });
         }
+        if self.results.is_empty() {
+            self.set_placeholder(true, window, cx);
+        }
+    }
+
+    fn set_placeholder(&mut self, shown: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.placeholder_shown == shown {
+            return;
+        }
+        self.placeholder_shown = shown;
+        let placeholder = self.placeholder.clone();
+        self.dock.update(cx, |dock, cx| {
+            if shown {
+                dock.add_panel_view(
+                    panel_handle(placeholder),
+                    DockPlacement::Bottom,
+                    Some(px(RESULTS_HEIGHT)),
+                    window,
+                    cx,
+                );
+            } else {
+                dock.remove_panel(placeholder, window, cx);
+            }
+        });
     }
 
     // User intents.
@@ -389,7 +439,9 @@ impl Workspace {
                     .primary()
                     .disabled(!can_run)
                     .tooltip("Run the selection or the current statement (Ctrl+Enter)")
-                    .on_click(cx.listener(|workspace, _, _, cx| workspace.run(RunMode::Current, cx))),
+                    .on_click(
+                        cx.listener(|workspace, _, _, cx| workspace.run(RunMode::Current, cx)),
+                    ),
             )
             .child(
                 Button::new("run-all")

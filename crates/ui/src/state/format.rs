@@ -54,7 +54,13 @@ fn single_line(text: &str) -> String {
     let mut shown: String = text
         .chars()
         .take(MAX_CELL_CHARS)
-        .map(|character| if character.is_control() { ' ' } else { character })
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
         .collect();
     if text.chars().count() > MAX_CELL_CHARS {
         shown.push('…');
@@ -66,8 +72,18 @@ fn single_line(text: &str) -> String {
 pub fn is_numeric_type(type_name: &str) -> bool {
     let lowered = type_name.to_ascii_lowercase();
     const NUMERIC_PREFIXES: [&str; 12] = [
-        "int", "bigint", "smallint", "tinyint", "mediumint", "serial", "numeric", "decimal",
-        "float", "double", "real", "money",
+        "int",
+        "bigint",
+        "smallint",
+        "tinyint",
+        "mediumint",
+        "serial",
+        "numeric",
+        "decimal",
+        "float",
+        "double",
+        "real",
+        "money",
     ];
     NUMERIC_PREFIXES
         .iter()
@@ -79,7 +95,7 @@ pub fn format_count(count: u64) -> String {
     let digits = count.to_string();
     let mut grouped = String::new();
     for (position, digit) in digits.chars().enumerate() {
-        if position > 0 && (digits.len() - position) % 3 == 0 {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(digit);

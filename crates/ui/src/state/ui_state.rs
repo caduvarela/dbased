@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 
-use dbased_commands::{
-    Command, ConnectionId, Event, ExecuteTarget, RequestId, ResultId, TabId,
-};
+use dbased_commands::{Command, ConnectionId, Event, ExecuteTarget, RequestId, ResultId, TabId};
 
 use super::{
     connections::ConnectionsModel,
@@ -46,10 +44,6 @@ impl UiState {
         self.results.get(&id)
     }
 
-    pub fn results(&self) -> impl Iterator<Item = &ResultModel> {
-        self.results.values()
-    }
-
     pub fn tab_status(&self, tab: TabId) -> Option<TabStatus> {
         let tab = self.tabs.get(tab)?;
         let connection = self.connections.get(tab.connection).map(|item| item.state);
@@ -63,12 +57,9 @@ impl UiState {
     }
 
     pub fn can_cancel(&self, tab: TabId) -> bool {
-        self.tabs.get(tab).is_some_and(|tab| {
-            matches!(
-                tab.activity,
-                Activity::Starting(_) | Activity::Running(_)
-            )
-        })
+        self.tabs
+            .get(tab)
+            .is_some_and(|tab| matches!(tab.activity, Activity::Starting(_) | Activity::Running(_)))
     }
 
     pub fn dismiss_notice(&mut self) {
@@ -142,12 +133,7 @@ impl UiState {
         Some((fresh, commands))
     }
 
-    pub fn execute(
-        &mut self,
-        tab: TabId,
-        script: String,
-        target: ExecuteTarget,
-    ) -> Vec<Command> {
+    pub fn execute(&mut self, tab: TabId, script: String, target: ExecuteTarget) -> Vec<Command> {
         let request = self.ids.request();
         let Some(model) = self.tabs.get_mut(tab) else {
             return Vec::new();
@@ -199,8 +185,7 @@ impl UiState {
     }
 
     pub fn toggle_node(&mut self, key: &NodeKey) -> Vec<Command> {
-        self.explorer
-            .toggle(key, &self.connections, &mut self.ids)
+        self.explorer.toggle(key, &self.connections, &mut self.ids)
     }
 
     // Core events.
