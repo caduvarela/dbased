@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dbased_commands::{ColumnMeta, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{CoreError, DatabaseErrorInfo, UserSql};
@@ -159,9 +159,6 @@ pub trait Driver: Send + Sync {
     /// Opens a dedicated session (one physical connection, outside the pool) (2.2).
     async fn open_session(&self) -> Result<Box<dyn Session>, CoreError>;
 
-    /// Cancels from a separate connection, for any session of this driver (3.2).
-    fn canceller(&self) -> Arc<dyn Canceller>;
-
     async fn list_schemas(&self) -> Result<Vec<Schema>, CoreError>;
     async fn list_tables(&self, schema: &str) -> Result<Vec<TableRef>, CoreError>;
     async fn list_columns(&self, table: &TableRef) -> Result<Vec<Column>, CoreError>;
@@ -185,6 +182,10 @@ pub trait DriverFactory {
 pub trait Session: Send {
     fn session_id(&self) -> SessionId;
 
+    /// A cloneable handle that cancels this session's running statement from a separate
+    /// connection. It stops working once the session releases its connection (3.2).
+    fn cancel_handle(&self) -> CancelHandle;
+
     /// Runs ONE statement and streams its rows into the sink. On cancel it
     /// drains to the terminal result; it never returns with the statement
     /// still in flight (3.2). Server errors come back in the outcome; `Err` is
@@ -203,8 +204,58 @@ pub trait Session: Send {
     async fn close(self: Box<Self>);
 }
 
+/// Driver-side cancel mechanism, addressed by backend id. Only `CancelHandle` calls it, and
+/// only while the session still holds that backend's connection.
 #[async_trait]
 pub trait Canceller: Send + Sync {
     /// Issues a cancel from a SEPARATE connection (3.2).
-    async fn cancel(&self, session: SessionId) -> Result<(), CoreError>;
+    async fn cancel_backend(&self, backend: SessionId) -> Result<(), CoreError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The cancel was delivered to the server.
+    Sent,
+    /// The session already released its connection; nothing was sent.
+    SessionClosed,
+}
+
+/// Cancels the statement of ONE live session. A cancel after the session released its
+/// connection is a no-op, so it can never reach a stranger that reused the backend id.
+#[derive(Clone)]
+pub struct CancelHandle {
+    backend: SessionId,
+    canceller: Arc<dyn Canceller>,
+    // @NOTE: `true` while the connection is held. Cancels hold the read side while sending and
+    // the session takes the write side before dropping the socket, so none can follow the close.
+    held: Arc<RwLock<bool>>,
+}
+
+impl CancelHandle {
+    pub fn new(backend: SessionId, canceller: Arc<dyn Canceller>) -> Self {
+        Self {
+            backend,
+            canceller,
+            held: Arc::new(RwLock::new(true)),
+        }
+    }
+
+    pub async fn cancel(&self) -> Result<CancelOutcome, CoreError> {
+        let held = self.held.read().await;
+        if !*held {
+            return Ok(CancelOutcome::SessionClosed);
+        }
+        self.canceller.cancel_backend(self.backend).await?;
+        Ok(CancelOutcome::Sent)
+    }
+
+    /// Called by the owning session right before it drops its connection.
+    pub async fn mark_released(&self) {
+        *self.held.write().await = false;
+    }
+
+    /// Cancel for the session's own abnormal-close path, which still holds the connection.
+    pub async fn cancel_while_held(&self) -> Result<(), CoreError> {
+        self.canceller.cancel_backend(self.backend).await
+    }
 }

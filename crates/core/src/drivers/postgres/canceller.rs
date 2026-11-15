@@ -15,7 +15,6 @@ const ONE_OFF_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Cancels from a connection that is never a session's own (docs/PROJECT.md 3.2).
 ///
 /// @NOTE: must never derive `Debug`; `PgConnectOptions` prints the password.
-// @TODO: decide the canceller API shape (per-session handle vs. id lookup) with a product call.
 pub(super) struct PostgresCanceller {
     pool: PgPool,
     options: PgConnectOptions,
@@ -75,7 +74,7 @@ async fn run_cancel(connection: &mut PgConnection, backend_pid: i32) -> Result<b
 
 #[async_trait]
 impl Canceller for PostgresCanceller {
-    async fn cancel(&self, session: SessionId) -> Result<(), CoreError> {
+    async fn cancel_backend(&self, session: SessionId) -> Result<(), CoreError> {
         let backend_pid = i32::try_from(session.0)
             .map_err(|_| CoreError::CancelFailed("session id is not a Postgres pid".into()))?;
         let signalled = self.cancel_through_pool(backend_pid).await?;

@@ -6,6 +6,7 @@ mod errors;
 mod metadata;
 mod session;
 mod sql;
+mod transaction;
 mod values;
 
 use std::collections::HashMap;
@@ -21,7 +22,7 @@ use self::canceller::PostgresCanceller;
 use self::errors::map_sqlx_error;
 use self::session::{PostgresSession, SessionSettings};
 use crate::{
-    Canceller, Column, CoreError, Driver, DriverFactory, PageRequest, Routine, Schema, Session,
+    CancelHandle, Column, CoreError, Driver, DriverFactory, PageRequest, Routine, Schema, Session,
     SessionId, TableRef, ViewRef,
 };
 
@@ -106,15 +107,11 @@ impl Driver for PostgresDriver {
         Ok(Box::new(PostgresSession::new(
             session_id,
             connection,
-            self.canceller.clone(),
+            CancelHandle::new(session_id, self.canceller.clone()),
             self.settings.clone(),
             self.type_names.clone(),
             self.pool.clone(),
         )))
-    }
-
-    fn canceller(&self) -> Arc<dyn Canceller> {
-        self.canceller.clone()
     }
 
     async fn list_schemas(&self) -> Result<Vec<Schema>, CoreError> {

@@ -16,11 +16,13 @@ use super::errors::{
     sqlstate_means_session_lost,
 };
 use super::sql::{assert_user_sql, looks_row_returning};
+use super::transaction::{TransactionState, probe_transaction_state};
 use super::values::{convert_row, estimated_size};
 use super::{PostgresConfig, TypeNameCache};
 use crate::{
-    CancelReason, Canceller, CloseReason, CoreError, DatabaseErrorInfo, RowSink, RowSinkMessage,
-    Session, SessionHealth, SessionId, SessionLimits, StatementOutcome, StatementStatus, UserSql,
+    CancelHandle, CancelOutcome, CancelReason, CloseReason, CoreError, DatabaseErrorInfo, RowSink,
+    RowSinkMessage, Session, SessionHealth, SessionId, SessionLimits, StatementOutcome,
+    StatementStatus, UserSql,
 };
 
 #[derive(Clone)]
@@ -61,7 +63,8 @@ pub(super) struct PostgresSession {
     id: SessionId,
     connection: Option<PgConnection>,
     lifecycle: Lifecycle,
-    canceller: Arc<dyn Canceller>,
+    cancel_handle: CancelHandle,
+    transaction: TransactionState,
     settings: SessionSettings,
     type_names: Arc<TypeNameCache>,
     pool: PgPool,
@@ -71,7 +74,7 @@ impl PostgresSession {
     pub(super) fn new(
         id: SessionId,
         connection: PgConnection,
-        canceller: Arc<dyn Canceller>,
+        cancel_handle: CancelHandle,
         settings: SessionSettings,
         type_names: Arc<TypeNameCache>,
         pool: PgPool,
@@ -80,7 +83,8 @@ impl PostgresSession {
             id,
             connection: Some(connection),
             lifecycle: Lifecycle::Open,
-            canceller,
+            cancel_handle,
+            transaction: TransactionState::Idle,
             settings,
             type_names,
             pool,
@@ -102,8 +106,10 @@ impl PostgresSession {
         if reason != CloseReason::ClosedByCaller {
             // @NOTE: an abnormal close may leave a statement running; this is the last moment
             // the connection is held, so a late cancel cannot hit a stranger.
-            self.canceller.cancel(self.id).await.ok();
+            self.cancel_handle.cancel_while_held().await.ok();
         }
+        // @NOTE: after this no handle can send a cancel, so a reused backend id is never hit.
+        self.cancel_handle.mark_released().await;
         connection.close_hard().await.ok();
     }
 
@@ -130,6 +136,23 @@ impl PostgresSession {
         }
     }
 
+    /// Resolves an unknown transaction state; a failing connection is released.
+    async fn refresh_transaction_state(&mut self) -> Option<CloseReason> {
+        let connection = self.connection.as_mut()?;
+        let limit = self.settings.health_check_timeout;
+        match probe_transaction_state(connection, limit).await {
+            Ok(state) => {
+                self.transaction = state;
+                None
+            }
+            Err(()) => {
+                self.release_connection(CloseReason::HealthCheckFailed)
+                    .await;
+                Some(CloseReason::HealthCheckFailed)
+            }
+        }
+    }
+
     async fn probe(&mut self) -> SessionHealth {
         let Some(connection) = self.connection.as_mut() else {
             return SessionHealth::Closed(CloseReason::ConnectionError);
@@ -146,6 +169,10 @@ impl PostgresSession {
 impl Session for PostgresSession {
     fn session_id(&self) -> SessionId {
         self.id
+    }
+
+    fn cancel_handle(&self) -> CancelHandle {
+        self.cancel_handle.clone()
     }
 
     async fn execute(
@@ -165,8 +192,8 @@ impl Session for PostgresSession {
             return Err(CoreError::SessionClosed(CloseReason::ConnectionError));
         };
         let context = RunContext {
-            session_id: self.id,
-            canceller: self.canceller.as_ref(),
+            cancel_handle: &self.cancel_handle,
+            in_transaction: self.transaction.protects_user_work(),
             settings: &self.settings,
             type_names: &self.type_names,
             pool: &self.pool,
@@ -191,13 +218,22 @@ impl Session for PostgresSession {
         } else if report.server_error_means_session_lost() {
             self.release_connection(CloseReason::ConnectionError).await;
             SessionHealth::Closed(CloseReason::ConnectionError)
-        } else if report.cancel.is_some() {
+        } else if report.cancel_sent {
             self.probe().await
         } else if report.server_error_has_code(TRANSACTION_ABORTED) {
             SessionHealth::TransactionAborted
         } else {
             SessionHealth::Healthy
         };
+        let mut health = health;
+        if !matches!(health, SessionHealth::Closed(_)) {
+            self.transaction = self.transaction.after_statement(sql.as_str());
+            if self.transaction.needs_probe()
+                && let Some(reason) = self.refresh_transaction_state().await
+            {
+                health = SessionHealth::Closed(reason);
+            }
+        }
         self.finish_operation();
         let outcome = report.into_outcome(health);
         send_best_effort(&sink, RowSinkMessage::Outcome(outcome.clone())).await;
@@ -261,8 +297,9 @@ async fn probe_connection(connection: &mut PgConnection, limit: Duration) -> Ses
 }
 
 struct RunContext<'a> {
-    session_id: SessionId,
-    canceller: &'a dyn Canceller,
+    cancel_handle: &'a CancelHandle,
+    /// Whether the session was inside a user transaction when the statement started.
+    in_transaction: bool,
     settings: &'a SessionSettings,
     type_names: &'a TypeNameCache,
     pool: &'a PgPool,
@@ -275,6 +312,8 @@ struct RunReport {
     first_result_rows_affected: Option<u64>,
     headers_known: bool,
     cancel: Option<CancelReason>,
+    /// A cancel was actually issued; false when a Core-initiated stop only discarded rows.
+    cancel_sent: bool,
     cancel_error: Option<String>,
     server_error: Option<DatabaseErrorInfo>,
     extra_statements: bool,
@@ -333,6 +372,8 @@ impl RunReport {
 /// Tracks the explicit cancel of one statement (docs/PROJECT.md 3.2, rule 5).
 struct CancelState {
     reason: Option<CancelReason>,
+    /// Core-initiated stop inside a transaction: rows are discarded, nothing is cancelled.
+    discarding: bool,
     error: Option<String>,
     delivered: bool,
     drain_deadline: Option<Instant>,
@@ -343,6 +384,7 @@ impl CancelState {
     fn new() -> Self {
         Self {
             reason: None,
+            discarding: false,
             error: None,
             delivered: false,
             drain_deadline: None,
@@ -351,13 +393,24 @@ impl CancelState {
     }
 
     async fn request(&mut self, context: &RunContext<'_>, reason: CancelReason) {
-        if self.reason.is_some() {
+        if self.reason.is_some() && !(self.discarding && reason == CancelReason::User) {
+            return;
+        }
+        // @NOTE: a cap or a gone consumer must not abort the user's open transaction, so those
+        // only discard the rest of the stream. An explicit user cancel always cancels.
+        if reason != CancelReason::User && context.in_transaction {
+            self.reason = Some(reason);
+            self.discarding = true;
             return;
         }
         self.reason = Some(reason);
+        self.discarding = false;
         // @NOTE: only called while the statement's connection is still held by this session.
-        match context.canceller.cancel(context.session_id).await {
-            Ok(()) => self.delivered = true,
+        match context.cancel_handle.cancel().await {
+            Ok(CancelOutcome::Sent) => self.delivered = true,
+            Ok(CancelOutcome::SessionClosed) => {
+                self.error = Some("the session already released its connection".to_owned());
+            }
             Err(error) => self.error = Some(error.to_string()),
         }
         // @NOTE: the drain clock starts after the cancel returns, so a slow cancel does not eat it.
@@ -372,9 +425,9 @@ impl CancelState {
         let Some(deadline) = self.drain_deadline else {
             return;
         };
-        let sending = context.canceller.cancel(context.session_id);
+        let sending = context.cancel_handle.cancel();
         match tokio::time::timeout_at(deadline, sending).await {
-            Ok(Ok(())) if !self.delivered => {
+            Ok(Ok(CancelOutcome::Sent)) if !self.delivered => {
                 self.delivered = true;
                 self.error = None;
             }
@@ -490,6 +543,7 @@ async fn run_statement(
     }
 
     report.cancel = cancel.reason;
+    report.cancel_sent = cancel.reason.is_some() && !cancel.discarding;
     report.cancel_error = cancel.error;
     if !columns_sent {
         let usable = report.server_error.is_none()
