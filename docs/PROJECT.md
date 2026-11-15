@@ -77,8 +77,9 @@ reasoning kept, rather than deleted.
     CJK and Wayland still pending (Part 10).
   - The editor must take focus on open and tab activation (6.1); shortcut
     tests go through the real keymap (7.1).
-  - Emoji hotkeys depend on an XIM input method; DBased ships its own
-    emoji/symbol picker on `Ctrl+.` (6.1).
+  - Emoji hotkeys depend on an XIM input method; `Ctrl+.` stays bound to
+    upstream code actions (VS Code-consistent), and a DBased emoji/symbol
+    picker is low priority, command palette only (6.1).
 - **2026-11 — Editor UX and Later features.** Sections marked
   **(revised 2026-11, editor UX)** or **(new 2026-11)**:
   - The default keymap preset is VS Code-like (VS Code Windows mapping on
@@ -1365,7 +1366,7 @@ UI. Drivers stay as modules inside `core` until a concrete architectural need
 (for example a plugin system) justifies splitting them. *(Revised 2026-11,
 editor UX.)* One such split is planned: the SQL scanner (2.7) moves into a
 pure `dbased-sql` crate, used by `core` and `ui`, when the first synchronous
-editor feature needs it (9.4.1).
+editor feature needs it (9.4.1). Approved by the product owner (2026-11).
 
 Workspace-wide enforcement (in the root manifest): `unsafe` code is forbidden,
 clippy denies `unwrap_used` and `expect_used`, `[workspace.dependencies]`
@@ -2074,11 +2075,11 @@ to input methods only through XIM (the `zed-xim` crate): it needs
 `XMODIFIERS=@im=<name>` and a running XIM-capable daemon (ibus, fcitx5),
 otherwise it finds no server and text arrives as plain key events. There is no
 IBus/fcitx D-Bus path, and `Window::show_character_palette()` does nothing on
-Linux. So DBased provides **its own emoji and symbol picker** (a popover, also
-in the command palette, that inserts text at the cursor), independent of any
-input method. DBased ships no code actions, so the upstream `ctrl-.` binding
-(`ToggleCodeActions`) is removed in the editor context and `Ctrl+.` opens the
-picker instead. Where an input method is connected and uses `Ctrl+.` itself,
+Linux. `Ctrl+.` stays bound to the upstream code actions (`ToggleCodeActions`),
+matching VS Code's Quick Fix; they become useful once an SQL language server
+is attached. An emoji and symbol picker (a command-palette entry that inserts
+text at the cursor, independent of any input method) is **low priority** and
+may be dropped. Where an input method is connected and uses `Ctrl+.` itself,
 it sees the key first and wins (to verify on XIM and Wayland). The docs list
 the environment an input method needs, because a hotkey that opens nothing is
 usually the desktop, not DBased.
@@ -2391,7 +2392,7 @@ Default preset (Linux and Windows; macOS uses Cmd for Ctrl, as VS Code does):
 | Undo last cursor | Ctrl+U | build, needs upstream |
 | Toggle line comment | Ctrl+/ | build |
 | Format document or selection | Shift+Alt+F | 9.6 (Later) |
-| Emoji and symbol picker | Ctrl+. | 6.1 |
+| Code actions (quick fix) | Ctrl+. | 6.1 |
 
 **This mapping is VS Code's on Windows and macOS, not on Linux.** VS Code on
 Linux uses Shift+Alt+Up/Down for *add cursor* and Ctrl+Shift+Alt+Up/Down for
@@ -2805,8 +2806,7 @@ fallback paths (a wrapped or custom editor element) remain available.
 
 ### Still open
 
-- `Ctrl+.` binding (6.1, 9.4): to confirm that it opens DBased's symbol
-  picker instead of upstream code actions.
+- Emoji/symbol picker (6.1): low priority, command palette only; may be dropped.
 - Formatting presets (9.6): names and contents of the 3-4 bundled presets,
   chosen by the product owner when phase 2 is scheduled.
 - Documentation strategy is being defined separately and, once agreed, becomes

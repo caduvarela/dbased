@@ -26,11 +26,10 @@
 - MySQL zero-date in the binary protocol: `is_null()` true, or empty bytes?
 - Keyring calls from `spawn_blocking` inside the Core runtime; TLS `verify-ca` / `verify-full` against real roots.
 - Tokenizer matrix additions in 2.7.
-- An input method that uses `Ctrl+.` sees the key before the app (XIM, Wayland), so DBased's picker binding does not shadow it.
+- An input method that uses `Ctrl+.` sees the key before the app (XIM, Wayland); `Ctrl+.` stays upstream code actions.
 - Upstream Ctrl+Alt+click (no drag) adds a cursor on Linux; MySQL 8.4 JSON output for `EXPLAIN ANALYZE`.
 
 ## Open questions (user)
-- Rebind `Ctrl+.` from upstream code actions to DBased's emoji/symbol picker (proposed: yes)?
+- (Resolved 2026-11: `Ctrl+.` stays code actions; `dbased-sql` crate approved.)
 - Names and contents of the 3-4 formatting presets (9.6).
-- Moving the scanner into a pure `dbased-sql` crate shared by `core` and `ui` when smart multi-cursor is built (9.4.1, 1.3)?
 - `sqlparser`, `toml`, `serde`-in-core are declared but unused; `unused_dependencies` lint is allowed workspace-wide until ui/app use their declared deps.
