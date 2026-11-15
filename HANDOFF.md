@@ -1,33 +1,37 @@
 # Handoff
 
 ## Done
-- Workspace skeleton: `dbased-commands`, `dbased-core`, `dbased-ui`, `dbased-app` (binary `dbased`); fmt, clippy, build pass.
+- Workspace skeleton: `dbased-commands`, `dbased-core`, `dbased-ui`, `dbased-app` (binary `dbased`); fmt, clippy, build pass. `etcetera` and the `keyring-core` stores are in the manifest.
 - Dev compose (`compose.yaml`, `.env`, `dev/seed/`, `dev/README.md`): Postgres 17 and MySQL 8.4 with seeded data incl. a 1M-row table.
-- Week-one spike items 6-8 (tokenizer, keyring, driver gotchas) folded into `docs/PROJECT.md`.
-- Week-one spike items 1, 2, 4, 5 (grid, editor, startup, Dock) DONE, item 3 (IME) PARTIAL, folded into `docs/PROJECT.md` (revision log, GUI spike entry; 0.1, 0.4, 5.2, 6.1-6.3, 9.2, Part 10). Spike code lives outside the repo in `../dbased-spike`. Gate passed for starting the real UI.
+- Week-one spike (items 1-8) and the 2026-11 human tests on X11/MATE folded into `docs/PROJECT.md` (Part 10, 6.1, 7.1). Spike code lives outside the repo in `../dbased-spike`. Gate passed for starting the real UI.
+- Recorded as Later (not next): VS Code-like default keymap (9.4), smart multi-cursor (9.4.1), step-by-step debug mode (9.5), SQL formatting with portable styles (9.6), explain visualization (9.7), own emoji/symbol picker (6.1).
 
 ## In progress
 - Nothing.
 
 ## Next step
 - First real driver (Postgres): the 2.1 trait (Session / Canceller, `UserSql`, `health_check`), the `AssertSqlSafe` invariant in the `UserSql` conversion (1.2, rule 1), the 3.2 cancel policy with integration tests (clean cancel, late cancel, aborted transaction, drain timeout).
-- In parallel or next: real UI shell in `crates/ui` (Dock with explorer / editor / bottom result tabs, grid against a fake Core source) following the 6.3 grid rules. Add `tree-sitter-sql` and `gpui-base =0.9.1` to `ui` only when first used.
+- In parallel or next: real UI shell in `crates/ui` (Dock with explorer / editor / bottom result tabs, grid against a fake Core source) following the 6.3 grid rules; the editor takes focus on open and tab activation (6.1). Add `tree-sitter-sql` and `gpui-base =0.9.1` to `ui` only when first used.
+- Not next: the keymap commands, smart multi-cursor and the Later features above.
 
 ## Pending manual checks (Part 10 gate status)
-- Item 3 IME checklist on X11 and Wayland (`../dbased-spike` README, section 3).
-- Look at the grid by eye near the end of 5M rows, with wheel and scrollbar drag.
+- CJK composition with a real input method (XIM on X11: `XMODIFIERS` plus ibus/fcitx5).
 - Items 1-5 on Wayland; grid on lower-end hardware and under GPU contention.
 - Startup with dropped caches (cold).
 
 ## Re-verify before relying on it
-- Grid 60 fps on a quiet machine: the persisted spike logs (`../dbased-spike/results.txt`, `logs/grid*.log`) only contain the 33 ms contention runs; record a clean run.
+- Grid 60 fps on a quiet machine: the persisted spike logs only contain the 33 ms contention runs; record a clean run.
 - Editor RSS growth (127 -> ~295-385 MB on 100K lines): one-time or per-edit?
 - Dropped-future and cancel behavior on the extended protocol / `prepare` / sqlx `begin()`.
 - MySQL zero-date in the binary protocol: `is_null()` true, or empty bytes?
 - Keyring calls from `spawn_blocking` inside the Core runtime; TLS `verify-ca` / `verify-full` against real roots.
 - Tokenizer matrix additions in 2.7.
+- An input method that uses `Ctrl+.` sees the key before the app (XIM, Wayland), so DBased's picker binding does not shadow it.
+- Upstream Ctrl+Alt+click (no drag) adds a cursor on Linux; MySQL 8.4 JSON output for `EXPLAIN ANALYZE`.
 
-## Open questions
-- Default keymap preset (recommendation: DBeaver-like).
-- Swap `directories` for `etcetera` in the workspace manifest; `sqlparser`, `toml`, `serde`-in-core are declared but unused.
-- `unused_dependencies` lint is allowed workspace-wide until ui/app use their declared deps.
+## Open questions (user)
+- Shortcut mapping on Linux: the requested one (Shift+Alt+Up/Down copies lines, Ctrl+Alt+Up/Down adds cursors, as VS Code on Windows/macOS) or real VS Code on Linux (Shift+Alt adds cursors, Ctrl+Shift+Alt copies lines)?
+- Rebind `Ctrl+.` from upstream code actions to DBased's emoji/symbol picker (proposed: yes)?
+- Names and contents of the 3-4 formatting presets (9.6).
+- Moving the scanner into a pure `dbased-sql` crate shared by `core` and `ui` when smart multi-cursor is built (9.4.1, 1.3)?
+- `sqlparser`, `toml`, `serde`-in-core are declared but unused; `unused_dependencies` lint is allowed workspace-wide until ui/app use their declared deps.
