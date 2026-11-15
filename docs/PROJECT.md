@@ -77,6 +77,8 @@ reasoning kept, rather than deleted.
     CJK and Wayland still pending (Part 10).
   - The editor must take focus on open and tab activation (6.1); shortcut
     tests go through the real keymap (7.1).
+  - Emoji hotkeys depend on an XIM input method; DBased ships its own
+    emoji/symbol picker on `Ctrl+.` (6.1).
 
 ---
 
@@ -2051,6 +2053,20 @@ spike's shortcuts silently did nothing until it focused the editor. Rule: the
 editor takes focus when its tab is opened or activated, and a tab restores
 focus to its editor when the user returns to it.
 
+*(Human test, 2026-11.)* **Input methods and symbol entry.** gpui on X11 talks
+to input methods only through XIM (the `zed-xim` crate): it needs
+`XMODIFIERS=@im=<name>` and a running XIM-capable daemon (ibus, fcitx5),
+otherwise it finds no server and text arrives as plain key events. There is no
+IBus/fcitx D-Bus path, and `Window::show_character_palette()` does nothing on
+Linux. So DBased provides **its own emoji and symbol picker** (a popover, also
+in the command palette, that inserts text at the cursor), independent of any
+input method. DBased ships no code actions, so the upstream `ctrl-.` binding
+(`ToggleCodeActions`) is removed in the editor context and `Ctrl+.` opens the
+picker instead. Where an input method is connected and uses `Ctrl+.` itself,
+it sees the key first and wins (to verify on XIM and Wayland). The docs list
+the environment an input method needs, because a hotkey that opens nothing is
+usually the desktop, not DBased.
+
 **Why.** Native, Tree-sitter highlighted, LSP-capable, GPU-rendered. Covers a SQL
 client's editing needs without a webview. Serves Performance and Simplicity.
 
@@ -2059,7 +2075,9 @@ upstream; the VS Code-style commands built on them are tracked as OPEN-6. The
 input component exposes no IME preedit/commit callbacks (only
 `marked_text_range` and Change / PressEnter / Focus / Blur events), so IME,
 dead keys and paste quality can only be checked by a manual checklist on X11
-and Wayland (Part 10, item 3). Contained to `ui` either way.
+and Wayland (Part 10, item 3). The own picker is a small extra component, kept
+because symbol entry would otherwise depend on each user's desktop setup.
+Contained to `ui` either way.
 
 ### 6.2 UI state *(revised 2026-11, spike)*
 
