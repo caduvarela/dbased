@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use dbased_commands::ColumnMeta;
 use futures_util::StreamExt as _;
 use sqlx::postgres::types::Oid;
-use sqlx::postgres::{PgPool, PgRow};
+use sqlx::postgres::{PgColumn, PgPool};
 use sqlx::{Column as _, Connection as _, Executor as _, PgConnection, Row as _, Statement as _};
 use sqlx::{Either, TypeInfo as _};
 use tokio::time::{Instant, sleep_until, timeout};
@@ -450,8 +450,28 @@ async fn run_statement(
     let mut pending_columns: Option<Vec<ColumnMeta>> = None;
     let mut bytes_buffered = 0usize;
     let mut results_seen = 0u32;
+    let mut describe_attempted = false;
 
-    {
+    // @NOTE: the server sends RowDescription before the first row, but sqlx only exposes it
+    // together with that row. A Parse/Describe up front is the only way to show headers while
+    // a slow statement runs. It is skipped inside a transaction because a failed Parse (for
+    // example a multi-statement string) would abort the user's transaction.
+    if !context.in_transaction && looks_row_returning(sql.as_str()) {
+        describe_attempted = true;
+        let described = prepare_early(context, connection, sql, &mut cancel, &mut report).await;
+        if let Some(described) = described.filter(|columns| !columns.is_empty()) {
+            let columns = column_metadata(context, &described).await;
+            let message = RowSinkMessage::Columns(columns.clone());
+            if send_or_cancel(sink, message, token, &mut cancel, context).await {
+                columns_sent = true;
+                report.headers_known = true;
+            } else {
+                pending_columns = Some(columns);
+            }
+        }
+    }
+
+    if cancel.reason.is_none() && !report.drain_timed_out {
         let mut stream = sqlx::raw_sql(assert_user_sql(sql)).fetch_many(&mut *connection);
         loop {
             let item = match cancel.drain_deadline {
@@ -505,7 +525,7 @@ async fn run_statement(
                     if !columns_sent {
                         let columns = match pending_columns.take() {
                             Some(columns) => columns,
-                            None => column_metadata(context, &row).await,
+                            None => column_metadata(context, row.columns()).await,
                         };
                         let message = RowSinkMessage::Columns(columns.clone());
                         if !send_or_cancel(sink, message, token, &mut cancel, context).await {
@@ -552,7 +572,7 @@ async fn run_statement(
             && !report.drain_timed_out;
         let columns = match pending_columns {
             Some(columns) => columns,
-            None if usable && looks_row_returning(sql.as_str()) => {
+            None if usable && !describe_attempted && looks_row_returning(sql.as_str()) => {
                 match describe_columns(context, connection, sql).await {
                     Some(columns) => columns,
                     None => {
@@ -597,9 +617,9 @@ async fn send_or_cancel(
     }
 }
 
-async fn column_metadata(context: &RunContext<'_>, row: &PgRow) -> Vec<ColumnMeta> {
-    let mut columns = Vec::with_capacity(row.columns().len());
-    for column in row.columns() {
+async fn column_metadata(context: &RunContext<'_>, described: &[PgColumn]) -> Vec<ColumnMeta> {
+    let mut columns = Vec::with_capacity(described.len());
+    for column in described {
         let type_info = column.type_info();
         let mut type_name = type_info.name().to_owned();
         if type_name == "?"
@@ -644,6 +664,38 @@ async fn resolve_type_name(context: &RunContext<'_>, oid: u32) -> Option<String>
     Some(name)
 }
 
+/// Prepares (never executes) the statement before it runs, honouring cancel while the server
+/// parses it (Parse can wait on locks). A failure just yields no early headers; the statement
+/// then runs normally and reports its own error.
+async fn prepare_early(
+    context: &RunContext<'_>,
+    connection: &mut PgConnection,
+    sql: &UserSql,
+    cancel: &mut CancelState,
+    report: &mut RunReport,
+) -> Option<Vec<PgColumn>> {
+    let preparing = connection.prepare(sqlx::SqlSafeStr::into_sql_str(assert_user_sql(sql)));
+    tokio::pin!(preparing);
+    loop {
+        let draining = cancel.drain_deadline.is_some();
+        let deadline = cancel.drain_deadline.unwrap_or_else(Instant::now);
+        let resend_at = cancel.next_resend;
+        tokio::select! {
+            prepared = &mut preparing => {
+                return prepared.ok().map(|statement| statement.columns().to_vec());
+            }
+            () = context.token.cancelled(), if cancel.reason.is_none() => {
+                cancel.request(context, CancelReason::User).await;
+            }
+            () = sleep_until(deadline), if draining => {
+                report.drain_timed_out = true;
+                return None;
+            }
+            () = sleep_until(resend_at), if draining => cancel.resend(context).await,
+        }
+    }
+}
+
 /// Prepares (never executes) the statement to learn its headers; a failure just shows none.
 /// `None` means the prepare timed out and its future was dropped on the connection.
 async fn describe_columns(
@@ -658,15 +710,5 @@ async fn describe_columns(
     let Ok(statement) = prepared else {
         return Some(Vec::new());
     };
-    Some(
-        statement
-            .columns()
-            .iter()
-            .map(|column| ColumnMeta {
-                name: column.name().to_owned(),
-                type_name: column.type_info().name().to_owned(),
-                nullable: None,
-            })
-            .collect(),
-    )
+    Some(column_metadata(context, statement.columns()).await)
 }
