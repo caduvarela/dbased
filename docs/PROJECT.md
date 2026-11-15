@@ -1227,7 +1227,15 @@ running arbitrary SQL:
 1. **User SQL is wrapped in `AssertSqlSafe`.** sqlx 0.9 requires `&'static str`
    or `AssertSqlSafe(..)` for every query function. A SQL client executes
    user-written SQL by definition, so the wrapper is applied at exactly one
-   place in each driver (the execution entry point), never scattered.
+   place in each driver (the execution entry point), never scattered. The
+   invariant is enforced by types, not by comments: a `UserSql` newtype
+   represents SQL typed by the user, and a single conversion function per
+   driver turns `UserSql` into `AssertSqlSafe`. DBased's own statements
+   (metadata, pagination, editing) stay `&'static str` or are assembled with
+   `quote_identifier` and never become `UserSql`. The only comment lives on
+   that conversion function and is short and version-independent (why user SQL
+   is executed as-is, and that SQL we assemble ourselves must never pass
+   through it).
 2. **Ad-hoc scripts use `raw_sql`** (simple query protocol: multiple statements,
    results per statement, everything returned in text format, which pairs
    naturally with the `Value::Unknown` fallback). Statement-level work that
