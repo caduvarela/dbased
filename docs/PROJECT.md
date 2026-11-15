@@ -42,13 +42,24 @@ reasoning kept, rather than deleted.
   - Multi-cursor now exists upstream; OPEN-6 shrinks to finishing touches.
   - sqlx moved to 0.9: dynamic SQL needs `AssertSqlSafe`, TLS feature naming
     changed, and cancel-safety bugs mean a cancelled connection is discarded
-    (1.2, 3.2).
+    (1.2, 3.2; refined by the spike entry below).
   - Each editor tab gets a dedicated session, not a pooled one (2.2, 9.1).
   - SQL handling is a hybrid: an in-house tokenizer for splitting, parameters
     and cursor position, `sqlparser` for ASTs (4.2, 9.3, new 2.7).
   - keyring 4 split into `keyring-core` plus per-platform stores (5.1);
     `directories` is replaced by `etcetera` (5.2).
   - A week-one spike was added as a gate before building the real UI (Part 10).
+- **2026-11 — Week-one spike, items 6-8** (live Postgres 17 / MySQL 8.4,
+  sqlx 0.9.0). Sections marked **spike** or **revised after spike**:
+  - Cancel: explicit side-connection cancel, then drain; a session is kept after
+    a clean cancel (health-checked) and closed only on unknown protocol state.
+    This reverses "discard after every cancel" (3.2).
+  - Editor sessions are opened outside the pool (2.2, 9.1).
+  - Ad-hoc SQL runs one statement per `raw_sql` call over the text protocol
+    (1.2, 2.3, 2.5, 9.2).
+  - The in-house scanner is the only lexer; `sqlparser`'s tokenizer is a test
+    oracle (2.7).
+  - Keyring wiring decided for Linux; TLS verify modes still to verify (5.1, 5.3).
 
 ---
 
@@ -2201,11 +2212,25 @@ Checks:
 5. **Dock.** Layout save and restore round-trip; detach/float of a result panel.
 6. **Tokenizer groundwork.** Behavior of `sqlparser`'s tokenizer on `:name`, `?`,
    dollar quotes and `::`; decide how much the in-house tokenizer can reuse.
+   **DONE (2026-11).** sqlparser 0.64 lexes clean text correctly (`::`, dollar
+   quotes, dialect comments) but fails with no partial tokens on unterminated
+   input and reports char columns. Decision: the in-house scanner is the only
+   lexer, sqlparser's tokenizer is a test oracle; splitting needs compound-body
+   tracking and `DELIMITER` (2.7, 9.3).
 7. **Keyring stores.** Compile and exercise the `keyring-core` + platform store
    wiring from 5.1, including the "no Secret Service" path on Linux.
+   **DONE (2026-11, Linux only).** `keyring-core` 1.0 + zbus store round-trips
+   against gnome-keyring with no system packages; calls block, so they run on
+   `spawn_blocking`; no-service maps to `PlatformFailure`, locked to
+   `NoStorageAccess` (5.1). KWallet, macOS and Windows untested.
 8. **Driver gotchas.** Against live Postgres and MySQL (testcontainers):
    cancellation via side connection, discard-after-cancel, `raw_sql` multi-statement
    results, and the Value decoding matrix from 2.5.
+   **DONE (2026-11, Postgres 17, MySQL 8.4, sqlx 0.9.0).** Side-connection cancel
+   works and leaves the session usable with its state; dropped futures do not
+   cancel and stall the next use; MySQL may return success after `KILL QUERY`.
+   Result: keep-after-clean-cancel policy, sessions outside the pool, per-statement
+   text-protocol execution (2.2, 2.3, 2.5, 3.2, 9.2). TLS verify modes untested (5.3).
 
 **Why.** The documentation is a plan; these are the points where the plan could
 be wrong in ways that are expensive to discover later. Serves Engineering
