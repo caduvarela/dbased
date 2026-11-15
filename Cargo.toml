@@ -49,3 +49,10 @@ expect_used = "deny"
 # @TODO: remove once ui uses dbased-commands and app wires dbased-core (declared now to fix the dependency graph).
 [workspace.lints.cargo]
 unused_dependencies = "allow"
+
+# @NOTE: keep debug info for our crates only; dependency debug info dominates target/ size.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
