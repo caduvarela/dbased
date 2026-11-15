@@ -1245,7 +1245,9 @@ running arbitrary SQL:
    chrono). Use `PgPool` / `MySqlPool` concretely behind the `Driver` trait and
    decode through `Row::try_get_raw` plus `type_info().name()`, falling back to
    raw text or bytes for unmodeled types.
-4. **A cancelled connection is discarded, never returned to the pool** (see 3.2).
+4. **Never drop a sqlx future or stream to stop work** (it does not stop the
+   server, see 3.2). Editor sessions never enter the pool (2.2), and a pool
+   connection whose work was cancelled is closed, never returned (3.2).
 5. `Cargo.lock` is committed by this project; sqlx itself no longer tracks one,
    so its transitive dependencies drift unless we pin them.
 
@@ -1258,8 +1260,11 @@ sea-orm. No alternative covers both databases in one API; the ORMs add nothing
 for arbitrary SQL. Serves Maintainability and the "fewer dependencies" rule.
 
 **Trade-off.** sqlx exposes neither a cancel token nor the backend PID, and has
-open cancel-safety bugs (a dropped future can leave a pooled connection dirty),
-so cancellation is done at the SQL layer on dedicated connections (3.2). sqlx
+open cancel-safety issues (cancelled `begin()` / `prepare`). The spike showed
+a dropped query future does not cancel anything: the server keeps running and
+the connection's next use silently waits for it, and the pool does not stop a
+stateful connection from being reused. So cancellation is done at the SQL
+layer from a side connection, and connection hygiene is our policy (3.2). sqlx
 also releases slowly (0.8.6 in May 2025, 0.9.0 in May 2026) and fixes sit on
 `main` for months; we pin the version and accept taking a git revision if
 needed. **Escape hatch:** because every database sits behind the `Driver` trait,
@@ -1352,8 +1357,8 @@ pub trait Driver: Send + Sync {
     /// (not part of the trait object) keeps `dyn Driver` usable.
     // connect lives on a separate `DriverFactory` trait.
 
-    /// Acquires a dedicated session (one physical connection) for an editor
-    /// tab. See 2.2.
+    /// Opens a dedicated session (one physical connection, outside the
+    /// pool) for an editor tab. See 2.2.
     async fn open_session(&self) -> Result<Box<dyn Session>, CoreError>;
 
     // Metadata, loaded lazily per node (see Part 4).
@@ -1372,16 +1377,23 @@ pub trait Driver: Send + Sync {
 #[async_trait]
 pub trait Session: Send {
     /// Backend identifier captured when the session is opened
-    /// (`pg_backend_pid()` / `CONNECTION_ID()`), used by cancellation.
+    /// (`pg_backend_pid()` i32 / `CONNECTION_ID()` u64, stored as u64),
+    /// used by cancellation.
     fn session_id(&self) -> SessionId;
 
-    /// Streams rows. Returns column metadata immediately, then rows lazily.
+    /// Runs ONE statement and streams its rows into the sink. Column metadata
+    /// arrives with the first row, or from a describe when there are none
+    /// (2.3). On cancel it drains to the terminal result; it never returns
+    /// with the statement still in flight (3.2).
     async fn execute(
         &mut self,
-        sql: &str,
+        sql: UserSql,
         sink: RowSink,
         token: CancellationToken,
-    ) -> Result<QueryHandle, CoreError>;
+    ) -> Result<StatementOutcome, CoreError>;
+
+    /// Cheap liveness probe (`SELECT 1`) used after a cancel. See 3.2.
+    async fn health_check(&mut self) -> Result<SessionHealth, CoreError>;
 }
 
 #[async_trait]
@@ -1403,15 +1415,25 @@ side effect. Serves Maintainability.
 **Trade-off.** Some duplication between impls for similar metadata queries. We
 accept duplication over a leaky shared base.
 
-### 2.2 Connection, pool and session model *(revised 2026-11)*
+### 2.2 Connection, pool and session model *(revised 2026-11, spike)*
 
 **Decision.** Each saved Connection owns one pool (small, e.g. max 5) used for
 **stateless** work: metadata loading, table browse, export, and cancellation
 side-connections. Each **editor tab owns a dedicated session**: one physical
-connection checked out of the pool on first run and held for the life of the
-tab (released when the tab closes or after a configurable idle timeout). A
-running query borrows nothing extra; it runs on its tab's session. The pool is
-created on first use ("Open Connection"), not at app start.
+connection opened directly from the same connect options (**not** checked out
+of the pool) on first run and held for the life of the tab (closed when the
+tab closes or after a configurable idle timeout). A running query borrows
+nothing extra; it runs on its tab's session. The pool is created on first use
+("Open Connection"), not at app start. Connect options are built with the
+typed sqlx builders, never as URL strings, so the password never sits in a
+formatted string.
+
+Sessions stay outside the pool because the spike showed (a) session state
+lives on the physical connection and survives a return to the pool, so a
+pooled session would leak `SET search_path` / `USE db` / temp tables into
+metadata queries, and (b) with sessions held from the pool, a full pool makes
+even the cancel side connection fail with `PoolTimedOut`. Out-of-pool sessions
+make both impossible by construction rather than by accounting.
 
 **Why.** Users expect session state to persist between executions in the same
 editor: `SET`, temporary tables, `USE database`, transactions opened by hand.
@@ -1421,8 +1443,9 @@ never held hostage by a result grid: results are copied into the Core buffer
 (2.3) and the session is free for the next statement immediately. We still do
 **not** keep server cursors open per tab. Serves UX and Performance.
 
-**Trade-off.** One physical connection per open editor tab, so a connection's
-pool size must be larger than its open tab count, or sessions queue. The idle
+**Trade-off.** One physical connection per open editor tab on top of the pool,
+so the server sees up to pool size plus open tabs; sessions get none of the
+pool's lifetime management, so idle timeout and reconnect are ours. The idle
 timeout and a clear "session released" indicator keep this bounded and
 visible (No Magic). Table-browse pagination (2.4) re-queries per portion on the
 pool, an extra round trip per page versus a held cursor; cheap, and it frees
@@ -1621,35 +1644,61 @@ lifecycle for everything cancellable. Serves Maintainability and UX.
 
 **Trade-off.** None significant.
 
-### 3.2 Cancellation *(revised 2026-11)*
+### 3.2 Cancellation *(revised 2026-11, spike)*
 
-**Decision.** Two layers, both required, plus a hygiene rule:
+**Decision.** Cancel is always explicit, then the statement is driven to its
+end; a future is never dropped as a way to stop work.
 
-1. **Client side.** Triggering cancel fires the job's `CancellationToken`, which
-   stops the Core from consuming and buffering the stream.
-2. **Server side.** When a session is opened the Core captures its backend
-   identifier (`SELECT pg_backend_pid()` on Postgres, `SELECT CONNECTION_ID()`
-   on MySQL; sqlx exposes neither) and stores it on the session. Cancel opens a
-   **separate** connection from the same pool and issues
-   `SELECT pg_cancel_backend($pid)` (Postgres) or `KILL QUERY <id>` (MySQL). The
-   Postgres variant needs the same role or a superuser; a failure to cancel is
-   reported, not swallowed.
-3. **Discard after cancel.** A session that was cancelled (or whose future was
-   dropped mid-operation) is **closed and detached from the pool**, never
-   returned to it, and the tab transparently opens a fresh session on its next
-   run (with a visible note that session state was reset). Dropping a sqlx
-   future is **not** a cancellation mechanism: open sqlx issues show cancelled
-   `begin()` / `prepare` can leave a connection dirty.
+1. **Server-side cancel.** When a session is opened the Core captures its
+   backend id (`SELECT pg_backend_pid()` / `SELECT CONNECTION_ID()`). Cancel
+   runs `SELECT pg_cancel_backend($pid)` (Postgres) or `KILL QUERY <id>`
+   (MySQL) from a **separate** pool connection (short acquire timeout,
+   falling back to a one-off connection). Cancellable pool jobs (export,
+   browse) capture their own backend id at job start. A cancel is only ever
+   issued while the Core still holds the target connection open, because
+   MySQL reuses connection ids after close: a late `KILL` could hit a stranger.
+   A failed cancel is reported, not swallowed.
+2. **Drain, then decide.** After the cancel the Core keeps reading the stream
+   (discarding rows) until the terminal result, bounded by a drain timeout. The
+   job's `CancellationToken` stops buffering, not reading. The same path
+   handles the buffer cap (2.3) and closing a tab (cancel, then close).
+3. **Session policy.** An editor session is **kept** after a clean cancel:
+   cancel acknowledged, stream drained, and a `SELECT 1` health check
+   answered. A cancel error on the health check itself means a late cancel
+   was absorbed; it is retried once. A Postgres "transaction aborted" (25P02)
+   answer counts as alive: the user's manual transaction is theirs, so the
+   tab shows "transaction aborted, ROLLBACK required" instead of silently
+   rolling it back by reconnecting. The session is **closed** (and the next
+   run opens a fresh one, with a visible "session reset" note) only when the
+   drain times out, the health check fails with an I/O or protocol error, or
+   a future was ever dropped mid-operation (a bug path, kept as a guard).
+   Until the extended protocol is verified the same way, a cancelled
+   parameterized statement (9.3) also closes the session. sqlx's `Transaction` API is never used on sessions (user transactions are
+   plain SQL), so its transaction-depth cancel bugs cannot apply there.
+4. **Pool policy.** Pool connections hold no user state, so a pool connection
+   whose work was cancelled or ended abnormally is detached and closed, never
+   returned. Short metadata queries are not cancelled; an unwanted result is
+   simply ignored.
+5. **Recording.** "Cancelled" is a Core fact, not inferred from the result:
+   after `KILL QUERY`, MySQL may return success (`SELECT SLEEP` returns 1,
+   `DO SLEEP` returns Ok) or error 1317, and Postgres 57014 also comes from
+   `statement_timeout`. A job is `Cancelled` if the Core issued a cancel before
+   the statement's terminal result arrived; the server outcome is attached
+   (for example "server reported success: the statement may have taken
+   effect"), and rows received so far are kept and marked partial.
 
-**Why.** Dropping the stream alone leaves the database still computing a heavy
-query. The side-connection cancel actually stops the server work. Discarding the
-connection removes the dependency on sqlx's cancel-safety. Serves Performance
-and "never frozen".
+**Why.** The spike showed dropping a future leaves the server running and
+stalls the connection's next use silently (30 s for a 30 s sleep), while a
+clean server-side cancel leaves the connection usable within milliseconds with
+its session state intact (temp tables, settings). Discarding after every
+cancel would throw that state away for no safety gain; discarding only when
+the protocol state is unknown keeps both safety and the user's session. Serves
+Performance, UX and No Magic.
 
-**Trade-off.** One extra connection borrowed briefly at cancel time, and session
-state is lost after a cancel. The first is negligible; the second is surfaced to
-the user rather than hidden. If this proves too fragile on Postgres, the
-`tokio-postgres` escape hatch in 1.2 provides a native wire-level cancel.
+**Trade-off.** A drain and a health-check round trip after each cancel, and
+more states to test (clean, late cancel, aborted transaction, drain timeout).
+The spike verified the clean path on simple-protocol queries only. If Postgres cancel proves fragile, the `tokio-postgres` escape hatch
+(1.2) provides a native wire-level cancel.
 
 ### 3.3 Export *(revised 2026-11)*
 
@@ -1946,7 +1995,8 @@ requires" and avoid scope creep.
 tabs belong to connections) and owns a **dedicated session** (2.2), so session
 state persists across runs in that tab. A tab's editor holds multiple statements
 separated by a configurable delimiter (default `;`). Multiple tabs may target the
-same connection; each has its own session, all drawn from that connection's pool.
+same connection; each has its own session, opened from that connection's
+settings outside its pool (2.2).
 This is the DBeaver-like model: multi-tab, multi-statement per tab, one
 connection per tab.
 
@@ -2149,7 +2199,9 @@ philosophy are named out loud rather than hidden.
 - **No Magic / explicit over implicit.** 2.5 (faithful values, `Unknown`
   fallback, never silent corruption), 2.6 (previewable SQL, explicit opt-in, no
   silent multi-row writes), 0.2 (explicit command/event boundary even in-process),
-  3.2 (session reset after cancel is shown to the user). Tension named below.
+  3.2 ("cancelled" is recorded by the Core, never inferred; a session reset is
+  shown, an aborted transaction is reported rather than silently rolled back).
+  Tension named below.
 - **Maintainability.** 1.3 (workspace physically enforces independence), 2.1
   (driver trait, no giant match), 2.7 (each SQL need on the layer that fits it),
   3.4 (typed error categories), Part 7 (Core testable without UI), 0.1 and 0.2
@@ -2180,9 +2232,15 @@ philosophy are named out loud rather than hidden.
 - **Dedicated sessions vs Low resource use.** 2.2 holds one physical connection
   per open tab to keep session state correct. Bounded by idle release and made
   visible in the UI.
-- **sqlx convenience vs sqlx cancel-safety.** 1.2 and 3.2 accept sqlx's gaps and
-  neutralize them by discarding cancelled connections, with a `tokio-postgres`
-  driver as a prepared escape hatch.
+- **sqlx convenience vs sqlx cancel-safety.** 1.2 and 3.2 accept sqlx's gaps
+  (no cancel token, dropped futures that stall instead of cancel, a pool that
+  does not enforce hygiene) and neutralize them by policy: explicit cancel,
+  drain, health check, sessions outside the pool, cancelled pool connections
+  closed. The cost is a policy we must test ourselves; `tokio-postgres` stays
+  the prepared escape hatch.
+- **Session preservation vs simplicity of recovery.** 3.2 keeps a session
+  after a clean cancel instead of always reconnecting, to preserve the user's
+  temp tables and settings. Closing is reserved for unknown protocol state.
 - **This document's depth vs Simplicity First.** The planning is detailed; the
   product is not. This is write-once reference material, not runtime complexity,
   so it does not violate the pillar. Worth rereading rarely, not constantly.
