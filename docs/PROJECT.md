@@ -2243,15 +2243,20 @@ expected. Serves UX.
 
 **Trade-off.** One physical connection per open tab (see 2.2).
 
-### 9.2 Statement execution and result sets (run-current and run-all: MVP; parallel / separate-tab: Later)
+### 9.2 Statement execution and result sets (run-current and run-all: MVP; parallel / separate-tab / detached window: Later) *(revised 2026-11, spike)*
 
 **Decision.** Execution modes: run the current statement (under cursor), run the
 selection, run the whole script (all statements). Statement boundaries come from
 the in-house tokenizer (2.7), not blank-line guessing. One execution may yield
 multiple result sets; each becomes its own result tab linked to its statement,
-pinnable and detachable (detach and float via the Dock). MVP ships run-current
-and run-all into sequential result tabs; DBeaver's "execute each statement in a
-separate tab, in parallel" is Later.
+pinnable. Result tabs live in the bottom dock and can be dragged between dock
+groups and splits like any panel. There are **no floating panels** (the Dock
+has none, 0.4). Detaching a result to a separate OS window is Later: the spike
+showed the same panel entity can be hosted in a second `Root` window, but its
+lifecycle, focus, persistence (the dock layout does not cover extra windows)
+and Wayland behavior are unvalidated. MVP ships run-current and run-all into
+sequential result tabs; DBeaver's "execute each statement in a separate tab, in
+parallel" is Later.
 
 *(Revised 2026-11, spike.)* Run-all sends the split statements **one at a
 time** on the tab's session, stopping at the first error (the error is tied
