@@ -8,9 +8,8 @@ pub(super) fn assert_user_sql(sql: &UserSql) -> AssertSqlSafe<String> {
     AssertSqlSafe(sql.as_str().to_owned())
 }
 
-/// Cheap guess whether a statement returns rows, used only to decide if a
-/// prepare is worth it to get headers for an empty result (docs/PROJECT.md 2.3).
-pub(super) fn looks_row_returning(sql: &str) -> bool {
+/// The first keyword of a statement, lowercased, skipping blanks, comments and parentheses.
+pub(super) fn leading_keyword(sql: &str) -> String {
     let mut rest = sql;
     loop {
         rest = rest
@@ -23,13 +22,17 @@ pub(super) fn looks_row_returning(sql: &str) -> bool {
             break;
         }
     }
-    let keyword: String = rest
-        .chars()
+    rest.chars()
         .take_while(|character| character.is_ascii_alphabetic())
         .collect::<String>()
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+/// Cheap guess whether a statement returns rows, used only to decide if a
+/// prepare is worth it to get headers for an empty result (docs/PROJECT.md 2.3).
+pub(super) fn looks_row_returning(sql: &str) -> bool {
     matches!(
-        keyword.as_str(),
+        leading_keyword(sql).as_str(),
         "select" | "with" | "values" | "table" | "show" | "explain" | "fetch"
     )
 }
